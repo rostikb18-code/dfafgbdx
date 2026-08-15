@@ -41,7 +41,7 @@ MASTER_EMAIL = os.getenv("MASTER_EMAIL", "mhqizxqg@bekommenmail.com")
 MASTER_PASSWORD = os.getenv("MASTER_PASSWORD", "12346789")
 IMAP_MASTER_SERVER = os.getenv("IMAP_MASTER_SERVER", "bekommenmail.com")  # Без ://
 
-PAYGAME_SESSION = os.getenv("PAYGAME_SESSION", "ВСТАВЬТЕ_СЮДА_ЗНАЧЕНИЕ_COOKIE_SESSION")
+PAYGAME_SESSION = os.getenv("PAYGAME_SESSION", "uHC4EvIUTBhxPMRqWs7S")
 
 PAYGAME_COOKIES = {"session": PAYGAME_SESSION}
 HEADERS = {
