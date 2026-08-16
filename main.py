@@ -13,12 +13,11 @@ from contextlib import contextmanager
 from typing import Optional, Dict, List
 from urllib.parse import urlparse, unquote
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor
 
-# Стабильные внешние библиотеки
 import mysql.connector
 from mysql.connector import pooling
+from imap_tools import MailBox
 
 # =============================================================================
 # LOGGING
@@ -90,26 +89,29 @@ MASTER_EMAIL = os.environ.get("MASTER_EMAIL")
 MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD")
 IMAP_MASTER_SERVER = os.environ.get("IMAP_MASTER_SERVER", "imap.mail.ru")
 PAYGAME_SESSION = os.environ.get("PAYGAME_SESSION")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # Используется для DeepSeek
 
 # =============================================================================
-# AI
+# DEEPSEEK AI
 # =============================================================================
-ai_client = None
+import openai
+
+DEEPSEEK_API_KEY = OPENAI_API_KEY
+
+def setup_deepseek():
+    if DEEPSEEK_API_KEY:
+        openai.api_key = DEEPSEEK_API_KEY
+        openai.api_base = "https://api.deepseek.com"
+        logger.info("✅ DeepSeek API успешно подключен.")
+        return True
+    else:
+        logger.warning("⚠️ OPENAI_API_KEY не задан. ИИ-поддержка отключена.")
+        return False
+
+DEEPSEEK_ENABLED = setup_deepseek()
+
 AI_CHAT_HISTORY: Dict[str, List[Dict]] = {}
 AI_CHAT_HISTORY_LOCK = threading.Lock()
-AI_CACHE_TTL_SECONDS = 120
-AI_HISTORY_LIMIT = 10
-
-if OPENAI_API_KEY:
-    try:
-        ai_client = OpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url="https://api.deepseek.com"
-        )
-        logger.info("✅ DeepSeek API успешно подключен.")
-    except Exception as e:
-        logger.error(f"❌ Ошибка подключения DeepSeek API: {e}")
 
 # =============================================================================
 # DATABASE POOL
@@ -149,6 +151,19 @@ PAYGAME_HTTP_SESSION.headers.update({
     "Accept": "application/json",
     "Content-Type": "application/json",
 })
+
+def verify_paygame_session():
+    try:
+        test_response = PAYGAME_HTTP_SESSION.get("https://paygame.ru/api/v1/user", timeout=10)
+        if test_response.status_code == 200:
+            logger.info("✅ Paygame session валиден")
+            return True
+        else:
+            logger.error(f"❌ Paygame session невалиден: {test_response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки Paygame session: {e}")
+        return False
 
 # =============================================================================
 # THREAD POOL
@@ -221,7 +236,6 @@ def initialize_database():
     try:
         with db_connection() as conn:
             with conn.cursor() as cursor:
-                # Таблица аккаунтов
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS accounts (
                         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -241,7 +255,6 @@ def initialize_database():
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
                 
-                # Таблица продаж
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS sales (
                         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -256,7 +269,6 @@ def initialize_database():
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
                 
-                # Таблица логов
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS logs (
                         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -275,9 +287,6 @@ def initialize_database():
     except Exception:
         logger.exception("Критическая ошибка инициализации структуры БД")
 
-# =============================================================================
-# LOGS
-# =============================================================================
 def log_event(event_type: str, chat_id: Optional[str] = None, account_id: Optional[int] = None, message: str = ""):
     try:
         with db_connection() as conn:
@@ -314,25 +323,10 @@ def send_to_paygame(chat_id: str, text: str, retries: int = MAX_RETRY_ATTEMPTS) 
     log_event("send_failed", chat_id, None, str(text[:50]))
     return False
 
-def verify_paygame_session():
-    try:
-        test_response = PAYGAME_HTTP_SESSION.get("https://paygame.ru/api/v1/user", timeout=10)
-        if test_response.status_code == 200:
-            logger.info("✅ Paygame session валиден")
-            return True
-        else:
-            logger.error(f"❌ Paygame session невалиден: {test_response.status_code}")
-            send_telegram_notification("⚠️ PAYGAME_SESSION невалиден! Бот продолжит работу, но сообщения не будут отправляться.")
-            return False
-    except Exception as e:
-        logger.error(f"❌ Ошибка проверки Paygame session: {e}")
-        return False
-
 # =============================================================================
-# AI ASSISTANT
+# AI ASSISTANT (DEEPSEEK)
 # =============================================================================
 def clear_old_ai_history():
-    """Очищает историю чатов старше 2 часов"""
     while not SHUTDOWN_EVENT.is_set():
         time.sleep(AI_CLEANUP_INTERVAL)
         with AI_CHAT_HISTORY_LOCK:
@@ -347,7 +341,7 @@ def clear_old_ai_history():
                 logger.info(f"Очищено {len(chats_to_remove)} старых чатов из истории AI")
 
 def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) -> str:
-    if not ai_client:
+    if not DEEPSEEK_ENABLED or not DEEPSEEK_API_KEY:
         return "Извините, я автоматический бот. Пожалуйста, следуйте инструкциям выше."
     
     with AI_CHAT_HISTORY_LOCK:
@@ -377,7 +371,7 @@ def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) 
             messages.extend(AI_CHAT_HISTORY.get(chat_id, [])[-10:])
         messages.append({"role": "user", "content": buyer_message})
         
-        response = ai_client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="deepseek-v4-flash",
             messages=messages,
             timeout=10,
@@ -399,242 +393,6 @@ def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) 
 # =============================================================================
 # WEB ADMIN PANEL
 # =============================================================================
-class AdminPanelHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(get_admin_html().encode('utf-8'))
-        elif self.path == '/api/stats':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(get_stats()).encode('utf-8'))
-        elif self.path == '/api/accounts':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(get_accounts()).encode('utf-8'))
-        elif self.path == '/api/sales':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(get_sales()).encode('utf-8'))
-        elif self.path == '/api/logs':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(get_logs()).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def do_POST(self):
-        if self.path == '/api/account/add':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            data = json.loads(post_data.decode('utf-8'))
-            result = add_account(data)
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode('utf-8'))
-        elif self.path == '/api/account/delete':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            data = json.loads(post_data.decode('utf-8'))
-            result = delete_account(data.get('id'))
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(result).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        return
-
-def get_stats():
-    try:
-        with db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT COUNT(*) FROM accounts")
-                total = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_FREE,))
-                free = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_IN_RENT,))
-                rented = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_REST,))
-                resting = cursor.fetchone()[0]
-                
-                cursor.execute("SELECT SUM(price) FROM sales")
-                revenue = cursor.fetchone()[0] or 0
-                
-                cursor.execute("SELECT COUNT(*) FROM sales WHERE DATE(sold_at) = CURDATE()")
-                today_sales = cursor.fetchone()[0]
-                
-                return {
-                    'total': total,
-                    'free': free,
-                    'rented': rented,
-                    'resting': resting,
-                    'revenue': revenue,
-                    'today_sales': today_sales
-                }
-    except Exception as e:
-        logger.error(f"Ошибка получения статистики: {e}")
-        return {'error': str(e)}
-
-def get_accounts():
-    try:
-        with db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT id, email, trophies, price, rent_hours, status, chat_id, 
-                           rent_end_time, rest_until, last_status_update 
-                    FROM accounts 
-                    ORDER BY id DESC
-                """)
-                rows = cursor.fetchall()
-                accounts = []
-                status_map = {
-                    STATUS_FREE: 'Свободен',
-                    STATUS_WAIT_CODE: 'Ожидание кода',
-                    STATUS_IN_RENT: 'В аренде',
-                    STATUS_MANUAL_RESET: 'Требует сброса',
-                    STATUS_REST: 'Отдых'
-                }
-                for row in rows:
-                    accounts.append({
-                        'id': row[0],
-                        'email': row[1],
-                        'trophies': row[2],
-                        'price': row[3],
-                        'rent_hours': row[4],
-                        'status': status_map.get(row[5], 'Неизвестно'),
-                        'status_code': row[5],
-                        'chat_id': row[6] or '-',
-                        'rent_end_time': str(row[7]) if row[7] else '-',
-                        'rest_until': str(row[8]) if row[8] else '-',
-                        'last_update': str(row[9]) if row[9] else '-'
-                    })
-                return accounts
-    except Exception as e:
-        logger.error(f"Ошибка получения аккаунтов: {e}")
-        return []
-
-def get_sales():
-    try:
-        with db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT id, chat_id, account_email, trophies, price, rent_hours, sold_at, status
-                    FROM sales 
-                    ORDER BY sold_at DESC 
-                    LIMIT 100
-                """)
-                rows = cursor.fetchall()
-                sales = []
-                for row in rows:
-                    sales.append({
-                        'id': row[0],
-                        'chat_id': row[1],
-                        'account_email': row[2],
-                        'trophies': row[3],
-                        'price': row[4],
-                        'rent_hours': row[5],
-                        'sold_at': str(row[6]) if row[6] else '-',
-                        'status': row[7] or 'completed'
-                    })
-                return sales
-    except Exception as e:
-        logger.error(f"Ошибка получения продаж: {e}")
-        return []
-
-def get_logs():
-    try:
-        with db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT id, event_type, chat_id, account_id, message, created_at
-                    FROM logs 
-                    ORDER BY id DESC 
-                    LIMIT 50
-                """)
-                rows = cursor.fetchall()
-                logs = []
-                for row in rows:
-                    logs.append({
-                        'id': row[0],
-                        'event_type': row[1],
-                        'chat_id': row[2] or '-',
-                        'account_id': row[3] or '-',
-                        'message': row[4] or '-',
-                        'created_at': str(row[5]) if row[5] else '-'
-                    })
-                return logs
-    except Exception as e:
-        logger.error(f"Ошибка получения логов: {e}")
-        return []
-
-def add_account(data):
-    try:
-        email = data.get('email', '').strip()
-        password = data.get('password', '').strip()
-        imap_server = data.get('imap_server', '').strip()
-        trophies = int(data.get('trophies', 0))
-        price = int(data.get('price', 100))
-        rent_hours = int(data.get('rent_hours', 2))
-        
-        if not email or not password or not imap_server:
-            return {'success': False, 'error': 'Все поля обязательны'}
-        if trophies < 0:
-            return {'success': False, 'error': 'Кубки не могут быть отрицательными'}
-        if price <= 0:
-            return {'success': False, 'error': 'Цена должна быть больше 0'}
-        if rent_hours <= 0:
-            return {'success': False, 'error': 'Часы аренды должны быть больше 0'}
-        if '@' not in email:
-            return {'success': False, 'error': 'Некорректный email'}
-        
-        with db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO accounts (email, email_password, imap_server, trophies, price, rent_hours, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (email, password, imap_server, trophies, price, rent_hours, STATUS_FREE))
-                conn.commit()
-        
-        send_telegram_notification(f"📥 Добавлен аккаунт: {mask_email(email)} ({trophies}🏆, {price}₽)")
-        log_event("account_added", None, None, f"{mask_email(email)} ({trophies}🏆)")
-        return {'success': True}
-    except Exception as e:
-        logger.error(f"Ошибка добавления аккаунта: {e}")
-        return {'success': False, 'error': str(e)}
-
-def delete_account(account_id):
-    try:
-        with db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT email FROM accounts WHERE id = %s", (account_id,))
-                row = cursor.fetchone()
-                if not row:
-                    return {'success': False, 'error': 'Аккаунт не найден'}
-                email = row[0]
-                cursor.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
-                conn.commit()
-        send_telegram_notification(f"🗑️ Удален аккаунт: {mask_email(email)}")
-        log_event("account_deleted", None, account_id, mask_email(email))
-        return {'success': True}
-    except Exception as e:
-        logger.error(f"Ошибка удаления аккаунта: {e}")
-        return {'success': False, 'error': str(e)}
-
 def get_admin_html():
     return """
     <!DOCTYPE html>
@@ -943,6 +701,242 @@ def get_admin_html():
     </html>
     """
 
+class AdminPanelHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(get_admin_html().encode('utf-8'))
+        elif self.path == '/api/stats':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_stats()).encode('utf-8'))
+        elif self.path == '/api/accounts':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_accounts()).encode('utf-8'))
+        elif self.path == '/api/sales':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_sales()).encode('utf-8'))
+        elif self.path == '/api/logs':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_logs()).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_POST(self):
+        if self.path == '/api/account/add':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            result = add_account(data)
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+        elif self.path == '/api/account/delete':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            result = delete_account(data.get('id'))
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        return
+
+def get_stats():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM accounts")
+                total = cursor.fetchone()[0]
+                
+                cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_FREE,))
+                free = cursor.fetchone()[0]
+                
+                cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_IN_RENT,))
+                rented = cursor.fetchone()[0]
+                
+                cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_REST,))
+                resting = cursor.fetchone()[0]
+                
+                cursor.execute("SELECT SUM(price) FROM sales")
+                revenue = cursor.fetchone()[0] or 0
+                
+                cursor.execute("SELECT COUNT(*) FROM sales WHERE DATE(sold_at) = CURDATE()")
+                today_sales = cursor.fetchone()[0]
+                
+                return {
+                    'total': total,
+                    'free': free,
+                    'rented': rented,
+                    'resting': resting,
+                    'revenue': revenue,
+                    'today_sales': today_sales
+                }
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики: {e}")
+        return {'error': str(e)}
+
+def get_accounts():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, email, trophies, price, rent_hours, status, chat_id, 
+                           rent_end_time, rest_until, last_status_update 
+                    FROM accounts 
+                    ORDER BY id DESC
+                """)
+                rows = cursor.fetchall()
+                accounts = []
+                status_map = {
+                    STATUS_FREE: 'Свободен',
+                    STATUS_WAIT_CODE: 'Ожидание кода',
+                    STATUS_IN_RENT: 'В аренде',
+                    STATUS_MANUAL_RESET: 'Требует сброса',
+                    STATUS_REST: 'Отдых'
+                }
+                for row in rows:
+                    accounts.append({
+                        'id': row[0],
+                        'email': row[1],
+                        'trophies': row[2],
+                        'price': row[3],
+                        'rent_hours': row[4],
+                        'status': status_map.get(row[5], 'Неизвестно'),
+                        'status_code': row[5],
+                        'chat_id': row[6] or '-',
+                        'rent_end_time': str(row[7]) if row[7] else '-',
+                        'rest_until': str(row[8]) if row[8] else '-',
+                        'last_update': str(row[9]) if row[9] else '-'
+                    })
+                return accounts
+    except Exception as e:
+        logger.error(f"Ошибка получения аккаунтов: {e}")
+        return []
+
+def get_sales():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, chat_id, account_email, trophies, price, rent_hours, sold_at, status
+                    FROM sales 
+                    ORDER BY sold_at DESC 
+                    LIMIT 100
+                """)
+                rows = cursor.fetchall()
+                sales = []
+                for row in rows:
+                    sales.append({
+                        'id': row[0],
+                        'chat_id': row[1],
+                        'account_email': row[2],
+                        'trophies': row[3],
+                        'price': row[4],
+                        'rent_hours': row[5],
+                        'sold_at': str(row[6]) if row[6] else '-',
+                        'status': row[7] or 'completed'
+                    })
+                return sales
+    except Exception as e:
+        logger.error(f"Ошибка получения продаж: {e}")
+        return []
+
+def get_logs():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, event_type, chat_id, account_id, message, created_at
+                    FROM logs 
+                    ORDER BY id DESC 
+                    LIMIT 50
+                """)
+                rows = cursor.fetchall()
+                logs = []
+                for row in rows:
+                    logs.append({
+                        'id': row[0],
+                        'event_type': row[1],
+                        'chat_id': row[2] or '-',
+                        'account_id': row[3] or '-',
+                        'message': row[4] or '-',
+                        'created_at': str(row[5]) if row[5] else '-'
+                    })
+                return logs
+    except Exception as e:
+        logger.error(f"Ошибка получения логов: {e}")
+        return []
+
+def add_account(data):
+    try:
+        email = data.get('email', '').strip()
+        password = data.get('password', '').strip()
+        imap_server = data.get('imap_server', '').strip()
+        trophies = int(data.get('trophies', 0))
+        price = int(data.get('price', 100))
+        rent_hours = int(data.get('rent_hours', 2))
+        
+        if not email or not password or not imap_server:
+            return {'success': False, 'error': 'Все поля обязательны'}
+        if trophies < 0:
+            return {'success': False, 'error': 'Кубки не могут быть отрицательными'}
+        if price <= 0:
+            return {'success': False, 'error': 'Цена должна быть больше 0'}
+        if rent_hours <= 0:
+            return {'success': False, 'error': 'Часы аренды должны быть больше 0'}
+        if '@' not in email:
+            return {'success': False, 'error': 'Некорректный email'}
+        
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO accounts (email, email_password, imap_server, trophies, price, rent_hours, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (email, password, imap_server, trophies, price, rent_hours, STATUS_FREE))
+                conn.commit()
+        
+        send_telegram_notification(f"📥 Добавлен аккаунт: {mask_email(email)} ({trophies}🏆, {price}₽)")
+        log_event("account_added", None, None, f"{mask_email(email)} ({trophies}🏆)")
+        return {'success': True}
+    except Exception as e:
+        logger.error(f"Ошибка добавления аккаунта: {e}")
+        return {'success': False, 'error': str(e)}
+
+def delete_account(account_id):
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT email FROM accounts WHERE id = %s", (account_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return {'success': False, 'error': 'Аккаунт не найден'}
+                email = row[0]
+                cursor.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
+                conn.commit()
+        send_telegram_notification(f"🗑️ Удален аккаунт: {mask_email(email)}")
+        log_event("account_deleted", None, account_id, mask_email(email))
+        return {'success': True}
+    except Exception as e:
+        logger.error(f"Ошибка удаления аккаунта: {e}")
+        return {'success': False, 'error': str(e)}
+
 def run_admin_server():
     port = int(os.environ.get("ADMIN_PORT", "8080"))
     try:
@@ -959,7 +953,6 @@ def run_admin_server():
 def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[int] = None, target_trophies: Optional[int] = None):
     try:
         with db_connection() as conn:
-            # Проверка лимита покупок на день
             with conn.cursor() as cursor:
                 cursor.execute("SELECT COUNT(*) FROM sales WHERE chat_id = %s AND DATE(sold_at) = CURDATE()", (chat_id,))
                 if cursor.fetchone()[0] >= DAILY_PURCHASE_LIMIT:
