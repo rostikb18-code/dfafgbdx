@@ -8,37 +8,57 @@ import email
 import requests
 from contextlib import contextmanager
 from typing import Optional, Dict
+from urllib.parse import urlparse, unquote
 
 import pymysql
 from pymysql.cursors import DictCursor
 
 # =============================================================================
-# CONFIG
+# CONFIG (ПАРСИНГ MYSQL_URL ИЗ ПЕРЕМЕННЫХ RAILWAY)
 # =============================================================================
 
-DB_CONFIG = {
-    "host": "autorack.proxy.rlwy.net",
-    "user": "railway",
-    "password": "DGoDqbSoxOT1BKjmTGnRtIPJCvxEObjF",
-    "database": "railway",
-    "port": 27376,
-    "charset": "utf8mb4",
-    "connect_timeout": 10,
-    "read_timeout": 15,
-    "write_timeout": 15,
-    "autocommit": False,
-}
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL")
+
+
+def get_db_config() -> dict:
+    """Профессионально парсит системную URL-строку Railway и адаптирует под MySQL"""
+    if not DATABASE_URL:
+        # Резервный публичный коннект, если системная переменная не подтянулась
+        return {
+            "host": "autorack.proxy.rlwy.net",
+            "user": "railway",
+            "password": "DGoDqbSoxOT1BKjmTGnRtIPJCvxEObjF",
+            "database": "railway",
+            "port": 27376,
+            "charset": "utf8mb4",
+            "autocommit": False,
+        }
+
+    try:
+        parsed = urlparse(DATABASE_URL)
+        return {
+            "host": parsed.hostname,
+            "user": parsed.username,
+            "password": unquote(parsed.password) if parsed.password else "",
+            "database": parsed.path.lstrip("/"),
+            "port": parsed.port if parsed.port else 3306,
+            "charset": "utf8mb4",
+            "autocommit": False,
+        }
+    except Exception as parse_err:
+        raise ValueError(f"Критическая ошибка разбора строки DATABASE_URL: {parse_err}")
+
 
 POLL_INTERVAL = 15
-RESERVATION_TIMEOUT_MINUTES = 15
 DB_RETRIES = 3
 
+# Настройки для интеграции с почтой уведомлений площадки PayGame
 MASTER_EMAIL = "mhqizxqg@bekommenmail.com"
 MASTER_PASSWORD = "12346789"
-IMAP_MASTER_SERVER = "bekommenmail.com"  # без ://
+IMAP_MASTER_SERVER = "bekommenmail.com"  # Без ://
 
+# Ключ авторизации (session) автоматически подтянется из вкладки Variables на Railway
 PAYGAME_SESSION = os.getenv("PAYGAME_SESSION", "uHC4EvIUTBhxPMRqWs7S")
-
 PAYGAME_COOKIES = {"session": PAYGAME_SESSION}
 HEADERS = {
     "User-Agent": (
@@ -56,7 +76,6 @@ HEADERS = {
 
 ACCOUNT_FREE = 0
 ACCOUNT_RESERVED = 1
-ACCOUNT_DELIVERED = 2
 ACCOUNT_SOLD = 3
 
 # =============================================================================
@@ -99,7 +118,7 @@ def mask_email(value: str) -> str:
     return name[:2] + "***@" + domain
 
 # =============================================================================
-# DATABASE
+# DATABASE CONTEXT
 # =============================================================================
 
 
@@ -107,7 +126,8 @@ def mask_email(value: str) -> str:
 def db_connection():
     connection = None
     try:
-        connection = pymysql.connect(**DB_CONFIG)
+        config = get_db_config()
+        connection = pymysql.connect(**config)
         yield connection
     except Exception:
         if connection:
@@ -212,8 +232,6 @@ def check_paygame_sales() -> Optional[str]:
             for msg_id in messages[0].split():
                 _, data = mail.fetch(msg_id, "(RFC822)")
 
-                # data — это кортеж: (b'...', b'...')
-                # Берём вторую часть, где само письмо
                 if isinstance(data, tuple) and len(data) > 0:
                     msg_data = data[0][1] if isinstance(data[0], tuple) else data[0]
                 else:
