@@ -7,6 +7,7 @@ import threading
 import html
 import requests
 import json
+import asyncio
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import mysql.connector
 from mysql.connector import pooling
 from imap_tools import MailBox
+import openai
 
 # =============================================================================
 # LOGGING
@@ -41,12 +43,13 @@ DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL")
 RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
+BRAWL_STARS_API_KEY = os.environ.get("BRAWL_STARS_API_KEY")
 
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 5
 MAX_IDLE_THREADS = 20
 DAILY_PURCHASE_LIMIT = 3
-AI_CLEANUP_INTERVAL = 3600
+REST_DAYS = 1
 
 def get_db_config() -> dict:
     if not DATABASE_URL:
@@ -89,13 +92,11 @@ MASTER_EMAIL = os.environ.get("MASTER_EMAIL")
 MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD")
 IMAP_MASTER_SERVER = os.environ.get("IMAP_MASTER_SERVER", "imap.mail.ru")
 PAYGAME_SESSION = os.environ.get("PAYGAME_SESSION")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # Используется для DeepSeek
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # =============================================================================
 # DEEPSEEK AI
 # =============================================================================
-import openai
-
 DEEPSEEK_API_KEY = OPENAI_API_KEY
 
 def setup_deepseek():
@@ -119,7 +120,7 @@ AI_CHAT_HISTORY_LOCK = threading.Lock()
 try:
     db_pool = pooling.MySQLConnectionPool(
         pool_name="bot_pool",
-        pool_size=10,
+        pool_size=15,
         pool_reset_session=True,
         **get_db_config()
     )
@@ -169,6 +170,59 @@ def verify_paygame_session():
 # THREAD POOL
 # =============================================================================
 idle_thread_pool = ThreadPoolExecutor(max_workers=MAX_IDLE_THREADS)
+
+# =============================================================================
+# BRAWL STARS API
+# =============================================================================
+def get_brawl_stats(player_tag: str):
+    """Получает статистику игрока через API Brawl Stars"""
+    if not BRAWL_STARS_API_KEY:
+        logger.warning("⚠️ BRAWL_STARS_API_KEY не задан")
+        return None
+    
+    try:
+        url = f"https://api.brawlstars.com/v1/players/%23{player_tag.replace('#', '')}"
+        headers = {"Authorization": f"Bearer {BRAWL_STARS_API_KEY}"}
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "name": data.get("name", "Unknown"),
+                "trophies": data.get("trophies", 0),
+                "highestTrophies": data.get("highestTrophies", 0),
+                "brawlers_count": len(data.get("brawlers", [])),
+                "club": data.get("club", {}).get("name") if data.get("club") else None
+            }
+        else:
+            logger.error(f"Ошибка API Brawl Stars: {response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка запроса к Brawl Stars API: {e}")
+        return None
+
+def update_account_stats(account_id: int, player_tag: str):
+    """Обновляет статистику аккаунта через API Brawl Stars"""
+    stats = get_brawl_stats(player_tag)
+    if not stats:
+        return False
+    
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE accounts 
+                    SET trophies = %s, brawlers_count = %s, player_name = %s, 
+                        highest_trophies = %s, last_status_update = NOW()
+                    WHERE id = %s
+                """, (stats["trophies"], stats["brawlers_count"], stats["name"], 
+                      stats["highestTrophies"], account_id))
+                conn.commit()
+        logger.info(f"✅ Аккаунт ID {account_id} обновлён: {stats['trophies']}🏆, {stats['brawlers_count']} бойцов")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления аккаунта ID {account_id}: {e}")
+        return False
 
 # =============================================================================
 # CONSTANTS
@@ -242,16 +296,23 @@ def initialize_database():
                         email VARCHAR(255) NOT NULL,
                         email_password VARCHAR(255) NOT NULL,
                         imap_server VARCHAR(255) NOT NULL,
+                        player_tag VARCHAR(50) DEFAULT NULL,
+                        player_name VARCHAR(100) DEFAULT NULL,
                         status INT DEFAULT 0,
                         trophies INT DEFAULT 0,
+                        highest_trophies INT DEFAULT 0,
+                        brawlers_count INT DEFAULT 0,
                         price INT DEFAULT 100,
                         rent_hours INT DEFAULT 2,
                         chat_id VARCHAR(255) DEFAULT NULL,
                         rent_end_time DATETIME DEFAULT NULL,
                         rest_until DATETIME DEFAULT NULL,
+                        total_rents INT DEFAULT 0,
+                        total_revenue INT DEFAULT 0,
                         last_status_update DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                         INDEX idx_status_rent (status, rent_end_time),
-                        INDEX idx_chat_id (chat_id)
+                        INDEX idx_chat_id (chat_id),
+                        INDEX idx_player_tag (player_tag)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
                 
@@ -261,7 +322,9 @@ def initialize_database():
                         chat_id VARCHAR(255) NOT NULL,
                         account_id INT NOT NULL,
                         account_email VARCHAR(255) NOT NULL,
-                        trophies INT DEFAULT 0,
+                        player_tag VARCHAR(50) DEFAULT NULL,
+                        trophies_before INT DEFAULT 0,
+                        trophies_after INT DEFAULT 0,
                         price INT DEFAULT 0,
                         rent_hours INT DEFAULT 2,
                         sold_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -328,7 +391,7 @@ def send_to_paygame(chat_id: str, text: str, retries: int = MAX_RETRY_ATTEMPTS) 
 # =============================================================================
 def clear_old_ai_history():
     while not SHUTDOWN_EVENT.is_set():
-        time.sleep(AI_CLEANUP_INTERVAL)
+        time.sleep(3600)
         with AI_CHAT_HISTORY_LOCK:
             now = time.time()
             chats_to_remove = []
@@ -351,16 +414,16 @@ def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) 
             AI_CHAT_HISTORY[chat_id] = AI_CHAT_HISTORY[chat_id][-10:]
     
     system_prompt = f"""
-Ты — профессиональный ИИ-ассистент сервиса аренды аккаунтов на Paygame.
+Ты — профессиональный ИИ-ассистент сервиса аренды аккаунтов Brawl Stars на Paygame.
 
 ТЫ МОЖЕШЬ:
 - Отвечать на вопросы о времени аренды (2 часа)
 - Объяснять процесс: оплата → получение почты → получение кода → вход в игру
+- Отвечать на вопросы о кубках и бойцах
 
 ТЫ НЕ МОЖЕШЬ:
 - Никогда не называть почту, пароль или код до оплаты
 - Никогда не давать данные аккаунта до подтверждения оплаты
-- Никогда не просить дополнительные коды или пароли
 
 ТЕКУЩИЙ СТАТУС ЗАКАЗА: {current_bot_status}
 """
@@ -400,7 +463,7 @@ def get_admin_html():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Админ панель - Аренда аккаунтов</title>
+        <title>Админ панель - Аренда Brawl Stars</title>
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
@@ -414,6 +477,11 @@ def get_admin_html():
             .stat-card .number.orange { color: #d29922; }
             .stat-card .number.red { color: #f85149; }
             .stat-card .number.gold { color: #f0c94d; }
+            
+            .filters { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; }
+            .filters input, .filters select { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 12px; border-radius: 6px; }
+            .filters button { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
+            .filters button:hover { background: #30363d; }
             
             .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
             .tabs button { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; }
@@ -437,8 +505,12 @@ def get_admin_html():
             .form-add input:focus { border-color: #58a6ff; outline: none; }
             .form-add button { background: #2ea043; border: none; color: #fff; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; height: 42px; }
             .form-add button:hover { background: #3fb950; }
+            .form-add button.danger { background: #f85149; }
+            .form-add button.danger:hover { background: #da3633; }
             .btn-delete { background: #f85149; border: none; color: #fff; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
             .btn-delete:hover { background: #da3633; }
+            .btn-update { background: #d29922; border: none; color: #fff; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+            .btn-update:hover { background: #b8860b; }
             
             .refresh-btn { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 16px; border-radius: 6px; cursor: pointer; margin-bottom: 15px; }
             .refresh-btn:hover { background: #30363d; }
@@ -448,7 +520,7 @@ def get_admin_html():
     </head>
     <body>
         <div class="container">
-            <h1>🤖 Панель управления арендой аккаунтов</h1>
+            <h1>🎮 Панель управления арендой Brawl Stars</h1>
             
             <div class="stats" id="stats">
                 <div class="stat-card"><div class="number" id="stat-total">-</div><div class="label">Всего аккаунтов</div></div>
@@ -459,6 +531,20 @@ def get_admin_html():
                 <div class="stat-card"><div class="number green" id="stat-today">-</div><div class="label">Продаж сегодня</div></div>
             </div>
             
+            <div class="filters">
+                <input type="text" id="filter-search" placeholder="Поиск по почте/тегу..." oninput="loadAccounts()" />
+                <select id="filter-status" onchange="loadAccounts()">
+                    <option value="">Все статусы</option>
+                    <option value="0">Свободен</option>
+                    <option value="1">Ожидание кода</option>
+                    <option value="2">В аренде</option>
+                    <option value="3">Требует сброса</option>
+                    <option value="4">Отдых</option>
+                </select>
+                <button onclick="loadAccounts()">🔄 Обновить</button>
+                <button onclick="updateAllStats()">📊 Обновить все кубки</button>
+            </div>
+            
             <div class="tabs">
                 <button class="active" onclick="showTab('accounts')">📋 Аккаунты</button>
                 <button onclick="showTab('sales')">💰 Продажи</button>
@@ -467,40 +553,40 @@ def get_admin_html():
             </div>
             
             <div id="tab-accounts" class="tab-content active">
-                <button class="refresh-btn" onclick="loadAccounts()">🔄 Обновить</button>
                 <div style="overflow-x: auto;">
                     <table>
                         <thead>
                             <tr>
                                 <th>ID</th>
                                 <th>Почта</th>
+                                <th>Тег</th>
+                                <th>Имя</th>
                                 <th>🏆</th>
+                                <th>Бойцов</th>
                                 <th>Цена</th>
-                                <th>Часы</th>
                                 <th>Статус</th>
-                                <th>Чат</th>
+                                <th>Аренд</th>
                                 <th>Действия</th>
                             </tr>
                         </thead>
                         <tbody id="accounts-table">
-                            <tr><td colspan="8" style="text-align:center;color:#8b949e;">Загрузка...</td></tr>
+                            <tr><td colspan="10" style="text-align:center;color:#8b949e;">Загрузка...</td></tr>
                         </tbody>
                     </table>
                 </div>
             </div>
             
             <div id="tab-sales" class="tab-content">
-                <button class="refresh-btn" onclick="loadSales()">🔄 Обновить</button>
                 <div style="overflow-x: auto;">
                     <table>
                         <thead>
                             <tr>
                                 <th>ID</th>
                                 <th>Чат</th>
-                                <th>Почта</th>
-                                <th>🏆</th>
+                                <th>Тег</th>
+                                <th>🏆 до</th>
+                                <th>🏆 после</th>
                                 <th>Цена</th>
-                                <th>Часы</th>
                                 <th>Дата</th>
                             </tr>
                         </thead>
@@ -512,7 +598,6 @@ def get_admin_html():
             </div>
             
             <div id="tab-logs" class="tab-content">
-                <button class="refresh-btn" onclick="loadLogs()">🔄 Обновить</button>
                 <div style="overflow-x: auto;">
                     <table>
                         <thead>
@@ -537,6 +622,7 @@ def get_admin_html():
                     <div><input type="text" id="add-email" placeholder="Почта аккаунта" /></div>
                     <div><input type="text" id="add-password" placeholder="Пароль от почты" /></div>
                     <div><input type="text" id="add-imap" placeholder="IMAP сервер" /></div>
+                    <div><input type="text" id="add-tag" placeholder="Тег Brawl Stars (#2PPQVUQ8J)" /></div>
                     <div><input type="number" id="add-trophies" placeholder="Кубки" value="0" min="0" /></div>
                     <div><input type="number" id="add-price" placeholder="Цена" value="100" min="1" /></div>
                     <div><input type="number" id="add-rent-hours" placeholder="Часы" value="2" min="1" /></div>
@@ -571,24 +657,31 @@ def get_admin_html():
             }
             
             async function loadAccounts() {
+                const search = document.getElementById('filter-search').value;
+                const status = document.getElementById('filter-status').value;
                 try {
-                    const res = await fetch('/api/accounts');
+                    const res = await fetch(`/api/accounts?search=${encodeURIComponent(search)}&status=${status}`);
                     const data = await res.json();
                     const tbody = document.getElementById('accounts-table');
                     if (!data.length) {
-                        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#8b949e;">Нет аккаунтов</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#8b949e;">Нет аккаунтов</td></tr>';
                         return;
                     }
                     tbody.innerHTML = data.map(a => `
                         <tr>
                             <td>${a.id}</td>
-                            <td style="font-size:12px;">${a.email}</td>
+                            <td style="font-size:11px;">${a.email}</td>
+                            <td style="font-size:11px;color:#58a6ff;">${a.player_tag || '-'}</td>
+                            <td>${a.player_name || '-'}</td>
                             <td>${a.trophies}</td>
+                            <td>${a.brawlers_count}</td>
                             <td>${a.price}₽</td>
-                            <td>${a.rent_hours}</td>
                             <td><span class="status-badge status-${a.status_code === 0 ? 'free' : a.status_code === 1 ? 'wait' : a.status_code === 2 ? 'rent' : a.status_code === 3 ? 'reset' : 'rest'}">${a.status}</span></td>
-                            <td style="font-size:11px;">${a.chat_id}</td>
-                            <td><button class="btn-delete" onclick="deleteAccount(${a.id})">🗑️</button></td>
+                            <td>${a.total_rents || 0}</td>
+                            <td>
+                                <button class="btn-update" onclick="updateStats(${a.id}, '${a.player_tag || ''}')">🔄</button>
+                                <button class="btn-delete" onclick="deleteAccount(${a.id})">🗑️</button>
+                            </td>
                         </tr>
                     `).join('');
                 } catch(e) { console.error(e); }
@@ -607,10 +700,10 @@ def get_admin_html():
                         <tr>
                             <td>${s.id}</td>
                             <td style="font-size:11px;">${s.chat_id}</td>
-                            <td style="font-size:12px;">${s.account_email}</td>
-                            <td>${s.trophies}</td>
+                            <td style="font-size:11px;color:#58a6ff;">${s.player_tag || '-'}</td>
+                            <td>${s.trophies_before}</td>
+                            <td>${s.trophies_after}</td>
                             <td>${s.price}₽</td>
-                            <td>${s.rent_hours}</td>
                             <td style="font-size:12px;">${s.sold_at}</td>
                         </tr>
                     `).join('');
@@ -644,17 +737,13 @@ def get_admin_html():
                     email: document.getElementById('add-email').value.trim(),
                     password: document.getElementById('add-password').value.trim(),
                     imap_server: document.getElementById('add-imap').value.trim(),
+                    player_tag: document.getElementById('add-tag').value.trim(),
                     trophies: parseInt(document.getElementById('add-trophies').value) || 0,
                     price: parseInt(document.getElementById('add-price').value) || 100,
                     rent_hours: parseInt(document.getElementById('add-rent-hours').value) || 2
                 };
                 if (!data.email || !data.password || !data.imap_server) {
                     document.getElementById('add-result').textContent = '❌ Заполните все поля!';
-                    document.getElementById('add-result').style.color = '#f85149';
-                    return;
-                }
-                if (data.trophies < 0 || data.price <= 0 || data.rent_hours <= 0) {
-                    document.getElementById('add-result').textContent = '❌ Проверьте значения (цена и часы должны быть > 0)';
                     document.getElementById('add-result').style.color = '#f85149';
                     return;
                 }
@@ -671,6 +760,7 @@ def get_admin_html():
                         document.getElementById('add-email').value = '';
                         document.getElementById('add-password').value = '';
                         document.getElementById('add-imap').value = '';
+                        document.getElementById('add-tag').value = '';
                         loadStats();
                         loadAccounts();
                     } else {
@@ -693,6 +783,29 @@ def get_admin_html():
                 } catch(e) { console.error(e); }
             }
             
+            async function updateStats(id, tag) {
+                if (!tag) {
+                    alert('У аккаунта нет тега Brawl Stars');
+                    return;
+                }
+                try {
+                    await fetch('/api/account/update-stats', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({id: id, player_tag: tag})
+                    });
+                    loadAccounts();
+                } catch(e) { console.error(e); }
+            }
+            
+            async function updateAllStats() {
+                if (!confirm('Обновить статистику всех аккаунтов?')) return;
+                try {
+                    await fetch('/api/accounts/update-all-stats', { method: 'POST' });
+                    loadAccounts();
+                } catch(e) { console.error(e); }
+            }
+            
             loadStats();
             loadAccounts();
             setInterval(() => { loadStats(); }, 30000);
@@ -708,16 +821,18 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
             self.wfile.write(get_admin_html().encode('utf-8'))
+        elif self.path.startswith('/api/accounts'):
+            query = self.path.split('?', 1)[1] if '?' in self.path else ''
+            params = dict(p.split('=') for p in query.split('&') if '=' in p) if query else {}
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_accounts(params)).encode('utf-8'))
         elif self.path == '/api/stats':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(get_stats()).encode('utf-8'))
-        elif self.path == '/api/accounts':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(get_accounts()).encode('utf-8'))
         elif self.path == '/api/sales':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -751,6 +866,21 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(result).encode('utf-8'))
+        elif self.path == '/api/account/update-stats':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            result = update_account_stats_api(data.get('id'), data.get('player_tag'))
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+        elif self.path == '/api/accounts/update-all-stats':
+            result = update_all_accounts_stats()
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
@@ -764,66 +894,61 @@ def get_stats():
             with conn.cursor() as cursor:
                 cursor.execute("SELECT COUNT(*) FROM accounts")
                 total = cursor.fetchone()[0]
-                
                 cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_FREE,))
                 free = cursor.fetchone()[0]
-                
                 cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_IN_RENT,))
                 rented = cursor.fetchone()[0]
-                
                 cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_REST,))
                 resting = cursor.fetchone()[0]
-                
                 cursor.execute("SELECT SUM(price) FROM sales")
                 revenue = cursor.fetchone()[0] or 0
-                
                 cursor.execute("SELECT COUNT(*) FROM sales WHERE DATE(sold_at) = CURDATE()")
                 today_sales = cursor.fetchone()[0]
-                
                 return {
-                    'total': total,
-                    'free': free,
-                    'rented': rented,
-                    'resting': resting,
-                    'revenue': revenue,
-                    'today_sales': today_sales
+                    'total': total, 'free': free, 'rented': rented,
+                    'resting': resting, 'revenue': revenue, 'today_sales': today_sales
                 }
     except Exception as e:
         logger.error(f"Ошибка получения статистики: {e}")
         return {'error': str(e)}
 
-def get_accounts():
+def get_accounts(params: dict = None):
     try:
         with db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT id, email, trophies, price, rent_hours, status, chat_id, 
-                           rent_end_time, rest_until, last_status_update 
-                    FROM accounts 
-                    ORDER BY id DESC
-                """)
+                query = """
+                    SELECT id, email, player_tag, player_name, trophies, brawlers_count,
+                           price, rent_hours, status, chat_id, total_rents, total_revenue,
+                           rent_end_time, rest_until, last_status_update
+                    FROM accounts
+                    WHERE 1=1
+                """
+                args = []
+                if params:
+                    search = params.get('search', '')
+                    if search:
+                        query += " AND (email LIKE %s OR player_tag LIKE %s)"
+                        args.extend([f"%{search}%", f"%{search}%"])
+                    status = params.get('status', '')
+                    if status:
+                        query += " AND status = %s"
+                        args.append(int(status))
+                query += " ORDER BY id DESC"
+                cursor.execute(query, args)
                 rows = cursor.fetchall()
+                status_map = {0: 'Свободен', 1: 'Ожидание кода', 2: 'В аренде', 3: 'Требует сброса', 4: 'Отдых'}
                 accounts = []
-                status_map = {
-                    STATUS_FREE: 'Свободен',
-                    STATUS_WAIT_CODE: 'Ожидание кода',
-                    STATUS_IN_RENT: 'В аренде',
-                    STATUS_MANUAL_RESET: 'Требует сброса',
-                    STATUS_REST: 'Отдых'
-                }
                 for row in rows:
                     accounts.append({
-                        'id': row[0],
-                        'email': row[1],
-                        'trophies': row[2],
-                        'price': row[3],
-                        'rent_hours': row[4],
-                        'status': status_map.get(row[5], 'Неизвестно'),
-                        'status_code': row[5],
-                        'chat_id': row[6] or '-',
-                        'rent_end_time': str(row[7]) if row[7] else '-',
-                        'rest_until': str(row[8]) if row[8] else '-',
-                        'last_update': str(row[9]) if row[9] else '-'
+                        'id': row[0], 'email': row[1], 'player_tag': row[2] or '-',
+                        'player_name': row[3] or '-', 'trophies': row[4] or 0,
+                        'brawlers_count': row[5] or 0, 'price': row[6] or 0,
+                        'rent_hours': row[7] or 2, 'status': status_map.get(row[8], 'Неизвестно'),
+                        'status_code': row[8], 'chat_id': row[9] or '-',
+                        'total_rents': row[10] or 0, 'total_revenue': row[11] or 0,
+                        'rent_end_time': str(row[12]) if row[12] else '-',
+                        'rest_until': str(row[13]) if row[13] else '-',
+                        'last_update': str(row[14]) if row[14] else '-'
                     })
                 return accounts
     except Exception as e:
@@ -835,23 +960,17 @@ def get_sales():
         with db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT id, chat_id, account_email, trophies, price, rent_hours, sold_at, status
-                    FROM sales 
-                    ORDER BY sold_at DESC 
-                    LIMIT 100
+                    SELECT id, chat_id, player_tag, trophies_before, trophies_after, price, sold_at
+                    FROM sales ORDER BY sold_at DESC LIMIT 100
                 """)
                 rows = cursor.fetchall()
                 sales = []
                 for row in rows:
                     sales.append({
-                        'id': row[0],
-                        'chat_id': row[1],
-                        'account_email': row[2],
-                        'trophies': row[3],
-                        'price': row[4],
-                        'rent_hours': row[5],
-                        'sold_at': str(row[6]) if row[6] else '-',
-                        'status': row[7] or 'completed'
+                        'id': row[0], 'chat_id': row[1] or '-',
+                        'player_tag': row[2] or '-', 'trophies_before': row[3] or 0,
+                        'trophies_after': row[4] or 0, 'price': row[5] or 0,
+                        'sold_at': str(row[6]) if row[6] else '-'
                     })
                 return sales
     except Exception as e:
@@ -862,21 +981,13 @@ def get_logs():
     try:
         with db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT id, event_type, chat_id, account_id, message, created_at
-                    FROM logs 
-                    ORDER BY id DESC 
-                    LIMIT 50
-                """)
+                cursor.execute("SELECT id, event_type, chat_id, account_id, message, created_at FROM logs ORDER BY id DESC LIMIT 50")
                 rows = cursor.fetchall()
                 logs = []
                 for row in rows:
                     logs.append({
-                        'id': row[0],
-                        'event_type': row[1],
-                        'chat_id': row[2] or '-',
-                        'account_id': row[3] or '-',
-                        'message': row[4] or '-',
+                        'id': row[0], 'event_type': row[1], 'chat_id': row[2] or '-',
+                        'account_id': row[3] or '-', 'message': row[4] or '-',
                         'created_at': str(row[5]) if row[5] else '-'
                     })
                 return logs
@@ -889,31 +1000,38 @@ def add_account(data):
         email = data.get('email', '').strip()
         password = data.get('password', '').strip()
         imap_server = data.get('imap_server', '').strip()
+        player_tag = data.get('player_tag', '').strip().replace('#', '')
         trophies = int(data.get('trophies', 0))
         price = int(data.get('price', 100))
         rent_hours = int(data.get('rent_hours', 2))
         
         if not email or not password or not imap_server:
             return {'success': False, 'error': 'Все поля обязательны'}
-        if trophies < 0:
-            return {'success': False, 'error': 'Кубки не могут быть отрицательными'}
         if price <= 0:
             return {'success': False, 'error': 'Цена должна быть больше 0'}
-        if rent_hours <= 0:
-            return {'success': False, 'error': 'Часы аренды должны быть больше 0'}
-        if '@' not in email:
-            return {'success': False, 'error': 'Некорректный email'}
+        
+        # Если есть тег — обновим статистику через API
+        player_name = None
+        brawlers_count = 0
+        if player_tag and BRAWL_STARS_API_KEY:
+            stats = get_brawl_stats(player_tag)
+            if stats:
+                trophies = stats.get('trophies', trophies)
+                brawlers_count = stats.get('brawlers_count', 0)
+                player_name = stats.get('name')
         
         with db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    INSERT INTO accounts (email, email_password, imap_server, trophies, price, rent_hours, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (email, password, imap_server, trophies, price, rent_hours, STATUS_FREE))
+                    INSERT INTO accounts (email, email_password, imap_server, player_tag, player_name,
+                                          trophies, brawlers_count, price, rent_hours, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (email, password, imap_server, player_tag, player_name,
+                      trophies, brawlers_count, price, rent_hours, STATUS_FREE))
                 conn.commit()
         
-        send_telegram_notification(f"📥 Добавлен аккаунт: {mask_email(email)} ({trophies}🏆, {price}₽)")
-        log_event("account_added", None, None, f"{mask_email(email)} ({trophies}🏆)")
+        send_telegram_notification(f"📥 Добавлен аккаунт: {mask_email(email)} ({player_tag or 'без тега'}) {trophies}🏆")
+        log_event("account_added", None, None, f"{mask_email(email)} ({player_tag}) {trophies}🏆")
         return {'success': True}
     except Exception as e:
         logger.error(f"Ошибка добавления аккаунта: {e}")
@@ -935,6 +1053,30 @@ def delete_account(account_id):
         return {'success': True}
     except Exception as e:
         logger.error(f"Ошибка удаления аккаунта: {e}")
+        return {'success': False, 'error': str(e)}
+
+def update_account_stats_api(account_id: int, player_tag: str):
+    if not player_tag or not BRAWL_STARS_API_KEY:
+        return {'success': False, 'error': 'Нет тега или API ключа'}
+    success = update_account_stats(account_id, player_tag)
+    if success:
+        log_event("stats_updated", None, account_id, f"Обновлена статистика по тегу {player_tag}")
+        return {'success': True}
+    return {'success': False, 'error': 'Ошибка обновления'}
+
+def update_all_accounts_stats():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id, player_tag FROM accounts WHERE player_tag IS NOT NULL AND player_tag != ''")
+                accounts = cursor.fetchall()
+                for acc in accounts:
+                    if acc[1]:
+                        update_account_stats(acc[0], acc[1])
+                log_event("all_stats_updated", None, None, "Обновлена статистика всех аккаунтов")
+        return {'success': True, 'count': len(accounts)}
+    except Exception as e:
+        logger.error(f"Ошибка обновления всех аккаунтов: {e}")
         return {'success': False, 'error': str(e)}
 
 def run_admin_server():
@@ -970,7 +1112,6 @@ def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[i
             conn.start_transaction(isolation_level='READ COMMITTED')
             with conn.cursor(dictionary=True) as cursor:
                 if exclude_account_id and target_trophies is not None:
-                    target_trophies = target_trophies or 0
                     min_trophies = int(target_trophies * 0.8)
                     max_trophies = int(target_trophies * 1.2)
                     cursor.execute("""
@@ -1007,7 +1148,7 @@ def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[i
                 conn.commit()
             
             prefix = "Взамен прежнего подобран аналогичный аккаунт. " if exclude_account_id else ""
-            instruction = (f"🔔 {prefix}Введите этот Email в поле входа:\n\n"
+            instruction = (f"🔔 {prefix}Введите этот Email в поле входа Brawl Stars:\n\n"
                            f"👉 {account['email']}\n\n"
                            f"Нажмите отправку кода. Бот перехватит его и пришлет сюда.")
             send_to_paygame(chat_id, instruction)
@@ -1015,25 +1156,29 @@ def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[i
             send_telegram_notification(f"💰 Продажа!\nЧат: {chat_id}\nАккаунт: {mask_email(account['email'])} ({account['trophies']}🏆)")
             log_event("sale", chat_id, account['id'], f"{mask_email(account['email'])} ({account['trophies']}🏆)")
             
+            # Сохраняем кубки до аренды
+            trophies_before = account.get('trophies', 0)
+            
             with db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
-                        INSERT INTO sales (chat_id, account_id, account_email, trophies, price, rent_hours)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (chat_id, account['id'], account['email'], account['trophies'], account['price'], account['rent_hours']))
+                        INSERT INTO sales (chat_id, account_id, account_email, player_tag, trophies_before, price, rent_hours)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (chat_id, account['id'], account['email'], account.get('player_tag'), 
+                          trophies_before, account['price'], account['rent_hours']))
                     conn.commit()
             
             idle_thread_pool.submit(
                 instant_code_waiter,
                 account['id'], account['email'], account['email_password'], 
-                account['imap_server'], chat_id, account['trophies']
+                account['imap_server'], chat_id, account['trophies'], account.get('player_tag')
             )
             
     except Exception as e:
         logger.exception(f"Ошибка выделения аккаунта: {e}")
         log_event("error", chat_id, None, str(e))
 
-def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_server: str, chat_id: str, trophies: int):
+def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_server: str, chat_id: str, trophies: int, player_tag: str = None):
     logger.info(f"Запущен IDLE поток для {mask_email(user_email)}")
     code_pattern = re.compile(CODE_REGEX_PATTERN)
     timeout_minutes = 5
@@ -1042,7 +1187,7 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
     
     while not SHUTDOWN_EVENT.is_set():
         if datetime.now() - start_time > timedelta(minutes=timeout_minutes) and not code_received:
-            send_to_paygame(chat_id, "⏰ Код не пришел. Предлагаю аналогичный аккаунт с близкими кубками.")
+            send_to_paygame(chat_id, "⏰ Код не пришел. Предлагаю аналогичный аккаунт.")
             
             with db_connection() as conn:
                 with conn.cursor(dictionary=True) as cursor:
@@ -1083,7 +1228,7 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
                         code_received = True
                         logger.info(f"✅ Код {code} перехвачен для чата {chat_id}")
                         
-                        send_to_paygame(chat_id, f"🔑 Ваш код: {code}\n\n✅ Вход выполнен! Время аренды ({RENT_DURATION_HOURS} ч.) пошло.\n\n🎮 Удачной игры!\n⭐ Оцените наш сервис 5 звезд!")
+                        send_to_paygame(chat_id, f"🔑 Ваш код: {code}\n\n✅ Вход выполнен! Время аренды ({RENT_DURATION_HOURS} ч.) пошло.\n\n🎮 Удачной игры в Brawl Stars!\n⭐ Оцените наш сервис 5 звезд!")
                         mailbox.flag(msg.uid, 'SEEN', True)
                         
                         with db_connection() as conn:
@@ -1091,7 +1236,7 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
                                 end_rent_time = datetime.now() + timedelta(hours=RENT_DURATION_HOURS)
                                 cursor.execute("""
                                     UPDATE accounts 
-                                    SET status = %s, rent_end_time = %s 
+                                    SET status = %s, rent_end_time = %s, total_rents = total_rents + 1
                                     WHERE id = %s
                                 """, (STATUS_IN_RENT, end_rent_time, account_id))
                                 conn.commit()
@@ -1099,6 +1244,7 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
                         send_telegram_notification(f"🔑 Код выдан!\nЧат: {chat_id}\nКод: {code}")
                         log_event("code_delivered", chat_id, account_id, f"Код: {code}")
                         
+                        # Ждём окончания аренды
                         remaining = RENT_DURATION_HOURS * 3600
                         while remaining > 0 and not SHUTDOWN_EVENT.is_set():
                             time.sleep(10)
@@ -1114,13 +1260,42 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
                         if SHUTDOWN_EVENT.is_set():
                             return
                         
+                        # Обновляем статистику через API Brawl Stars
+                        if player_tag and BRAWL_STARS_API_KEY:
+                            stats = get_brawl_stats(player_tag)
+                            if stats:
+                                trophies_after = stats.get('trophies', 0)
+                                with db_connection() as conn:
+                                    with conn.cursor() as cursor:
+                                        cursor.execute("""
+                                            UPDATE accounts 
+                                            SET trophies = %s, brawlers_count = %s, player_name = %s,
+                                                highest_trophies = %s, last_status_update = NOW()
+                                            WHERE id = %s
+                                        """, (trophies_after, stats.get('brawlers_count', 0), 
+                                              stats.get('name'), stats.get('highestTrophies', 0), account_id))
+                                        conn.commit()
+                                
+                                # Обновляем продажу
+                                with db_connection() as conn:
+                                    with conn.cursor() as cursor:
+                                        cursor.execute("""
+                                            UPDATE sales 
+                                            SET trophies_after = %s 
+                                            WHERE account_id = %s AND trophies_after = 0
+                                            ORDER BY id DESC LIMIT 1
+                                        """, (trophies_after, account_id))
+                                        conn.commit()
+                        
+                        # Выход со всех устройств
                         logout_success = trigger_logout_session(user_email, user_pass, imap_server)
                         
                         if logout_success:
-                            send_to_paygame(chat_id, f"⏰ Время аренды ({RENT_DURATION_HOURS} ч.) истекло. Сессия завершена.\n⭐ Оцените нашу работу! Покупайте у нас еще! 🚀")
-                            reset_account_to_free(account_id)
-                            send_telegram_notification(f"⏰ Аренда завершена: {mask_email(user_email)}")
-                            log_event("rental_ended", chat_id, account_id, "Успешный выход")
+                            # Отправляем аккаунт на отдых на 1 день
+                            send_account_to_rest(account_id)
+                            send_to_paygame(chat_id, f"⏰ Время аренды ({RENT_DURATION_HOURS} ч.) истекло. Сессия завершена.\n\n♻️ Аккаунт обновлён и ушёл на отдых на {REST_DAYS} день. Скоро снова в продаже!\n⭐ Оцените нашу работу! Покупайте у нас еще! 🚀")
+                            send_telegram_notification(f"⏰ Аренда завершена: {mask_email(user_email)}. Аккаунт на отдыхе {REST_DAYS} день")
+                            log_event("rental_ended", chat_id, account_id, "Успешный выход, аккаунт на отдыхе")
                         else:
                             send_to_paygame(chat_id, "⚠️ Не удалось автоматически выйти. Выйдите вручную.")
                             update_account_status(account_id, STATUS_MANUAL_RESET)
@@ -1138,7 +1313,7 @@ def send_account_to_rest(account_id: int):
     try:
         with db_connection() as conn:
             with conn.cursor() as cursor:
-                rest_until_time = datetime.now() + timedelta(days=2)
+                rest_until_time = datetime.now() + timedelta(days=REST_DAYS)
                 cursor.execute("UPDATE accounts SET status = %s, rest_until = %s WHERE id = %s",
                              (STATUS_REST, rest_until_time, account_id))
                 conn.commit()
@@ -1199,6 +1374,7 @@ def trigger_logout_session(user, pwd, server) -> bool:
 def watchdog_and_timer_thread():
     logger.info("Поток Watchdog и контроля таймеров аренды запущен.")
     while not SHUTDOWN_EVENT.is_set():
+        # 1. Проверка истекших аренд
         try:
             with db_connection() as conn:
                 with conn.cursor(dictionary=True) as cursor:
@@ -1208,34 +1384,38 @@ def watchdog_and_timer_thread():
                         if acc['status'] != STATUS_IN_RENT:
                             continue
                         logger.info(f"Срок аренды аккаунта {mask_email(acc['email'])} истек.")
-                        try:
-                            logout_success = trigger_logout_session(acc['email'], acc['email_password'], acc['imap_server'])
-                        except Exception as e:
-                            logger.error(f"Ошибка выхода для {mask_email(acc['email'])}: {e}")
-                            logout_success = False
-                        
+                        logout_success = trigger_logout_session(acc['email'], acc['email_password'], acc['imap_server'])
                         if logout_success:
-                            reset_account_to_free(acc['id'])
-                            send_to_paygame(acc['chat_id'], "⏰ Время аренды истекло. Доступ закрыт.\n⭐ Оцените нашу работу!")
+                            # Обновляем статистику через API
+                            if acc.get('player_tag') and BRAWL_STARS_API_KEY:
+                                update_account_stats(acc['id'], acc['player_tag'])
+                            send_account_to_rest(acc['id'])
+                            send_to_paygame(acc['chat_id'], f"⏰ Время аренды истекло. Аккаунт обновлён и ушёл на отдых на {REST_DAYS} день.")
                             send_telegram_notification(f"⏰ Аренда завершена: {mask_email(acc['email'])}")
                             log_event("rental_expired", acc['chat_id'], acc['id'], "Автоматический выход")
                         else:
                             update_account_status(acc['id'], STATUS_MANUAL_RESET)
                             send_telegram_notification(f"🚨 Требуется ручной сброс: {mask_email(acc['email'])}")
-                            log_event("manual_reset_needed", acc['chat_id'], acc['id'], "Выход не удался")
         except Exception as e:
             logger.exception(f"Ошибка в watchdog: {e}")
         
+        # 2. Возврат аккаунтов с отдыха
         try:
             with db_connection() as conn:
                 with conn.cursor(dictionary=True) as cursor:
-                    cursor.execute("SELECT id, email FROM accounts WHERE status = %s AND rest_until <= NOW()", (STATUS_REST,))
+                    cursor.execute("SELECT * FROM accounts WHERE status = %s AND rest_until <= NOW()", (STATUS_REST,))
                     rested_accounts = cursor.fetchall()
                     for acc in rested_accounts:
-                        logger.info(f"Отдых для {mask_email(acc['email'])} завершен.")
+                        logger.info(f"Отдых для {mask_email(acc['email'])} завершен. Обновляем и выставляем...")
+                        
+                        # Обновляем статистику через API
+                        if acc.get('player_tag') and BRAWL_STARS_API_KEY:
+                            update_account_stats(acc['id'], acc['player_tag'])
+                        
+                        # Сбрасываем в FREE
                         reset_account_to_free(acc['id'])
-                        send_telegram_notification(f"♻️ Аккаунт вышел из отдыха: {mask_email(acc['email'])}")
-                        log_event("rest_ended", None, acc['id'], "Отдых завершен")
+                        send_telegram_notification(f"♻️ Аккаунт {mask_email(acc['email'])} вышел из отдыха и снова в продаже! {acc.get('trophies', 0)}🏆")
+                        log_event("rest_ended", None, acc['id'], "Отдых завершен, аккаунт снова в продаже")
         except Exception as e:
             logger.exception(f"Ошибка возврата аккаунтов из отдыха: {e}")
         
@@ -1274,15 +1454,15 @@ def sales_listener_thread():
                             
                             with db_connection() as conn:
                                 with conn.cursor(dictionary=True) as cursor:
-                                    cursor.execute("SELECT status, email FROM accounts WHERE chat_id = %s", (chat_id,))
+                                    cursor.execute("SELECT status, email, player_tag, trophies FROM accounts WHERE chat_id = %s", (chat_id,))
                                     acc_info = cursor.fetchone()
                             
                             status_desc = "Оплата не подтверждена. Задайте вопрос до покупки."
                             if acc_info:
                                 if acc_info['status'] == STATUS_WAIT_CODE:
-                                    status_desc = f"Ожидание кода для {mask_email(acc_info['email'])}"
+                                    status_desc = f"Ожидание кода для {mask_email(acc_info['email'])} ({acc_info['trophies']}🏆)"
                                 elif acc_info['status'] == STATUS_IN_RENT:
-                                    status_desc = f"Активна аренда {mask_email(acc_info['email'])}"
+                                    status_desc = f"Активна аренда {mask_email(acc_info['email'])} ({acc_info['trophies']}🏆)"
                             
                             ai_reply = ask_ai_assistant(chat_id, buyer_text, status_desc)
                             send_to_paygame(chat_id, f"🤖 {ai_reply}")
@@ -1314,7 +1494,7 @@ def railway_self_pinger():
 # MAIN
 # =============================================================================
 def main():
-    logger.info("🚀 Запуск профессионального бота...")
+    logger.info("🚀 Запуск профессионального бота для Brawl Stars...")
     
     required_vars = {
         "MASTER_EMAIL": MASTER_EMAIL,
@@ -1331,6 +1511,11 @@ def main():
         logger.critical("❌ Нет подключения к БД")
         return
     
+    if BRAWL_STARS_API_KEY:
+        logger.info("✅ Brawl Stars API ключ найден")
+    else:
+        logger.warning("⚠️ BRAWL_STARS_API_KEY не задан. Автообновление кубков отключено.")
+    
     verify_paygame_session()
     initialize_database()
     
@@ -1340,7 +1525,7 @@ def main():
     threading.Thread(target=watchdog_and_timer_thread, name="Watchdog", daemon=True).start()
     threading.Thread(target=clear_old_ai_history, name="AICleaner", daemon=True).start()
     
-    send_telegram_notification("🚀 Профессиональный бот запущен! Админ панель: " + (RAILWAY_PUBLIC_URL or "http://localhost:8080"))
+    send_telegram_notification("🚀 Профессиональный бот Brawl Stars запущен! Админ панель: " + (RAILWAY_PUBLIC_URL or "http://localhost:8080"))
     logger.info("✅ Бот успешно запущен!")
     
     try:
