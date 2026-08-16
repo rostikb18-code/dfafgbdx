@@ -14,11 +14,11 @@ from typing import Optional, Dict, List
 from urllib.parse import urlparse, unquote
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor
 
 # Стабильные внешние библиотеки
 import mysql.connector
 from mysql.connector import pooling
-from imap_tools import MailBox, MailBoxIdler
 
 # =============================================================================
 # LOGGING
@@ -40,9 +40,14 @@ logger.addHandler(file_handler)
 # =============================================================================
 DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL")
 RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL")
-
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
+
+MAX_RETRY_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 5
+MAX_IDLE_THREADS = 20
+DAILY_PURCHASE_LIMIT = 3
+AI_CLEANUP_INTERVAL = 3600
 
 def get_db_config() -> dict:
     if not DATABASE_URL:
@@ -83,17 +88,21 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 # =============================================================================
 MASTER_EMAIL = os.environ.get("MASTER_EMAIL")
 MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD")
-IMAP_MASTER_SERVER = os.environ.get("IMAP_MASTER_SERVER")
+IMAP_MASTER_SERVER = os.environ.get("IMAP_MASTER_SERVER", "imap.mail.ru")
 PAYGAME_SESSION = os.environ.get("PAYGAME_SESSION")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # =============================================================================
-# DEEPSEEK AI CLIENT
+# AI
 # =============================================================================
 ai_client = None
+AI_CHAT_HISTORY: Dict[str, List[Dict]] = {}
+AI_CHAT_HISTORY_LOCK = threading.Lock()
+AI_CACHE_TTL_SECONDS = 120
+AI_HISTORY_LIMIT = 10
+
 if OPENAI_API_KEY:
     try:
-        from openai import OpenAI
         ai_client = OpenAI(
             api_key=OPENAI_API_KEY,
             base_url="https://api.deepseek.com"
@@ -130,8 +139,11 @@ adapter = requests.adapters.HTTPAdapter(
 )
 PAYGAME_HTTP_SESSION.mount("https://", adapter)
 
-if PAYGAME_SESSION:
+if PAYGAME_SESSION and PAYGAME_SESSION not in ["ВСТАВЬТЕ_СЮДА", "ВСТАВЬТЕ_СЮДА_ЗНАЧЕНИЕ_COOKIE_SESSION"]:
     PAYGAME_HTTP_SESSION.cookies.set("session", PAYGAME_SESSION, domain="paygame.ru")
+else:
+    logger.error("❌ PAYGAME_SESSION не задан или невалиден!")
+
 PAYGAME_HTTP_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
@@ -139,10 +151,15 @@ PAYGAME_HTTP_SESSION.headers.update({
 })
 
 # =============================================================================
+# THREAD POOL
+# =============================================================================
+idle_thread_pool = ThreadPoolExecutor(max_workers=MAX_IDLE_THREADS)
+
+# =============================================================================
 # CONSTANTS
 # =============================================================================
 CODE_REGEX_PATTERN = os.environ.get("CODE_REGEX_PATTERN", r'\b\d{6}\b')
-LOGOUT_LINK_PATTERN = os.environ.get("LOGOUT_LINK_PATTERN", r'https://[\S]+?(?:logout|not-me|disavow|deauthorize|security|cancel)[\S]*?(?=["\'>\s]|$)')
+LOGOUT_LINK_PATTERN = os.environ.get("LOGOUT_LINK_PATTERN", r'https://[\S]+?(?:logout|not-me|disavow|deauthorize|security|cancel|выйти|завершить|сессию)[\S]*?(?=["\'>\s]|$)')
 
 STATUS_FREE = 0
 STATUS_WAIT_CODE = 1
@@ -239,10 +256,145 @@ def initialize_database():
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
                 
+                # Таблица логов
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS logs (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        event_type VARCHAR(50) NOT NULL,
+                        chat_id VARCHAR(255) DEFAULT NULL,
+                        account_id INT DEFAULT NULL,
+                        message TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_event_type (event_type),
+                        INDEX idx_created_at (created_at)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                """)
+                
                 conn.commit()
         logger.info("✅ База данных успешно проинициализирована.")
     except Exception:
         logger.exception("Критическая ошибка инициализации структуры БД")
+
+# =============================================================================
+# LOGS
+# =============================================================================
+def log_event(event_type: str, chat_id: Optional[str] = None, account_id: Optional[int] = None, message: str = ""):
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO logs (event_type, chat_id, account_id, message)
+                    VALUES (%s, %s, %s, %s)
+                """, (event_type, chat_id, account_id, message))
+                conn.commit()
+    except Exception:
+        logger.exception("Ошибка записи лога")
+
+# =============================================================================
+# PAYGAME SEND
+# =============================================================================
+def send_to_paygame(chat_id: str, text: str, retries: int = MAX_RETRY_ATTEMPTS) -> bool:
+    if not chat_id:
+        logger.error("chat_id пустой!")
+        return False
+    
+    url = f"https://paygame.ru{chat_id}/messages"
+    for attempt in range(retries):
+        try:
+            res = PAYGAME_HTTP_SESSION.post(url, json={"message": text}, timeout=10)
+            if res.status_code == 200:
+                log_event("message_sent", chat_id, None, text[:50])
+                return True
+            logger.warning(f"Ошибка Paygame API (попытка {attempt+1}/{retries}): {res.status_code}")
+            time.sleep(RETRY_DELAY_SECONDS)
+        except Exception as e:
+            logger.warning(f"Ошибка отправки (попытка {attempt+1}/{retries}): {e}")
+            time.sleep(RETRY_DELAY_SECONDS)
+    logger.error(f"Не удалось отправить сообщение в чат {chat_id} после {retries} попыток")
+    log_event("send_failed", chat_id, None, str(text[:50]))
+    return False
+
+def verify_paygame_session():
+    try:
+        test_response = PAYGAME_HTTP_SESSION.get("https://paygame.ru/api/v1/user", timeout=10)
+        if test_response.status_code == 200:
+            logger.info("✅ Paygame session валиден")
+            return True
+        else:
+            logger.error(f"❌ Paygame session невалиден: {test_response.status_code}")
+            send_telegram_notification("⚠️ PAYGAME_SESSION невалиден! Бот продолжит работу, но сообщения не будут отправляться.")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки Paygame session: {e}")
+        return False
+
+# =============================================================================
+# AI ASSISTANT
+# =============================================================================
+def clear_old_ai_history():
+    """Очищает историю чатов старше 2 часов"""
+    while not SHUTDOWN_EVENT.is_set():
+        time.sleep(AI_CLEANUP_INTERVAL)
+        with AI_CHAT_HISTORY_LOCK:
+            now = time.time()
+            chats_to_remove = []
+            for chat_id, history in AI_CHAT_HISTORY.items():
+                if history and history[-1].get('timestamp', now) < now - 7200:
+                    chats_to_remove.append(chat_id)
+            for chat_id in chats_to_remove:
+                del AI_CHAT_HISTORY[chat_id]
+            if chats_to_remove:
+                logger.info(f"Очищено {len(chats_to_remove)} старых чатов из истории AI")
+
+def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) -> str:
+    if not ai_client:
+        return "Извините, я автоматический бот. Пожалуйста, следуйте инструкциям выше."
+    
+    with AI_CHAT_HISTORY_LOCK:
+        if chat_id not in AI_CHAT_HISTORY:
+            AI_CHAT_HISTORY[chat_id] = []
+        if len(AI_CHAT_HISTORY[chat_id]) > 10:
+            AI_CHAT_HISTORY[chat_id] = AI_CHAT_HISTORY[chat_id][-10:]
+    
+    system_prompt = f"""
+Ты — профессиональный ИИ-ассистент сервиса аренды аккаунтов на Paygame.
+
+ТЫ МОЖЕШЬ:
+- Отвечать на вопросы о времени аренды (2 часа)
+- Объяснять процесс: оплата → получение почты → получение кода → вход в игру
+
+ТЫ НЕ МОЖЕШЬ:
+- Никогда не называть почту, пароль или код до оплаты
+- Никогда не давать данные аккаунта до подтверждения оплаты
+- Никогда не просить дополнительные коды или пароли
+
+ТЕКУЩИЙ СТАТУС ЗАКАЗА: {current_bot_status}
+"""
+    
+    try:
+        messages = [{"role": "system", "content": system_prompt}]
+        with AI_CHAT_HISTORY_LOCK:
+            messages.extend(AI_CHAT_HISTORY.get(chat_id, [])[-10:])
+        messages.append({"role": "user", "content": buyer_message})
+        
+        response = ai_client.chat.completions.create(
+            model="deepseek-v4-flash",
+            messages=messages,
+            timeout=10,
+            temperature=0.1
+        )
+        ai_reply = response.choices[0].message.content
+        
+        with AI_CHAT_HISTORY_LOCK:
+            if chat_id not in AI_CHAT_HISTORY:
+                AI_CHAT_HISTORY[chat_id] = []
+            AI_CHAT_HISTORY[chat_id].append({"role": "user", "content": buyer_message, "timestamp": time.time()})
+            AI_CHAT_HISTORY[chat_id].append({"role": "assistant", "content": ai_reply, "timestamp": time.time()})
+        
+        return ai_reply
+    except Exception as e:
+        logger.error(f"Ошибка DeepSeek API: {e}")
+        return "Я зафиксировал ваш вопрос. Администратор ответит вам в ближайшее время."
 
 # =============================================================================
 # WEB ADMIN PANEL
@@ -269,6 +421,11 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(get_sales()).encode('utf-8'))
+        elif self.path == '/api/logs':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_logs()).encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
@@ -303,27 +460,21 @@ def get_stats():
     try:
         with db_connection() as conn:
             with conn.cursor() as cursor:
-                # Всего аккаунтов
                 cursor.execute("SELECT COUNT(*) FROM accounts")
                 total = cursor.fetchone()[0]
                 
-                # Свободные аккаунты
                 cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_FREE,))
                 free = cursor.fetchone()[0]
                 
-                # В аренде
                 cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_IN_RENT,))
                 rented = cursor.fetchone()[0]
                 
-                # На отдыхе
                 cursor.execute("SELECT COUNT(*) FROM accounts WHERE status = %s", (STATUS_REST,))
                 resting = cursor.fetchone()[0]
                 
-                # Общая выручка
                 cursor.execute("SELECT SUM(price) FROM sales")
                 revenue = cursor.fetchone()[0] or 0
                 
-                # Продаж за сегодня
                 cursor.execute("SELECT COUNT(*) FROM sales WHERE DATE(sold_at) = CURDATE()")
                 today_sales = cursor.fetchone()[0]
                 
@@ -405,6 +556,32 @@ def get_sales():
         logger.error(f"Ошибка получения продаж: {e}")
         return []
 
+def get_logs():
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, event_type, chat_id, account_id, message, created_at
+                    FROM logs 
+                    ORDER BY id DESC 
+                    LIMIT 50
+                """)
+                rows = cursor.fetchall()
+                logs = []
+                for row in rows:
+                    logs.append({
+                        'id': row[0],
+                        'event_type': row[1],
+                        'chat_id': row[2] or '-',
+                        'account_id': row[3] or '-',
+                        'message': row[4] or '-',
+                        'created_at': str(row[5]) if row[5] else '-'
+                    })
+                return logs
+    except Exception as e:
+        logger.error(f"Ошибка получения логов: {e}")
+        return []
+
 def add_account(data):
     try:
         email = data.get('email', '').strip()
@@ -416,6 +593,14 @@ def add_account(data):
         
         if not email or not password or not imap_server:
             return {'success': False, 'error': 'Все поля обязательны'}
+        if trophies < 0:
+            return {'success': False, 'error': 'Кубки не могут быть отрицательными'}
+        if price <= 0:
+            return {'success': False, 'error': 'Цена должна быть больше 0'}
+        if rent_hours <= 0:
+            return {'success': False, 'error': 'Часы аренды должны быть больше 0'}
+        if '@' not in email:
+            return {'success': False, 'error': 'Некорректный email'}
         
         with db_connection() as conn:
             with conn.cursor() as cursor:
@@ -426,6 +611,7 @@ def add_account(data):
                 conn.commit()
         
         send_telegram_notification(f"📥 Добавлен аккаунт: {mask_email(email)} ({trophies}🏆, {price}₽)")
+        log_event("account_added", None, None, f"{mask_email(email)} ({trophies}🏆)")
         return {'success': True}
     except Exception as e:
         logger.error(f"Ошибка добавления аккаунта: {e}")
@@ -443,6 +629,7 @@ def delete_account(account_id):
                 cursor.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
                 conn.commit()
         send_telegram_notification(f"🗑️ Удален аккаунт: {mask_email(email)}")
+        log_event("account_deleted", None, account_id, mask_email(email))
         return {'success': True}
     except Exception as e:
         logger.error(f"Ошибка удаления аккаунта: {e}")
@@ -461,7 +648,7 @@ def get_admin_html():
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
             .container { max-width: 1400px; margin: 0 auto; }
             h1 { color: #58a6ff; margin-bottom: 20px; border-bottom: 1px solid #30363d; padding-bottom: 15px; }
-            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
+            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 30px; }
             .stat-card { background: #161b22; border-radius: 10px; padding: 20px; text-align: center; border: 1px solid #30363d; }
             .stat-card .number { font-size: 28px; font-weight: bold; color: #58a6ff; }
             .stat-card .label { color: #8b949e; font-size: 14px; margin-top: 5px; }
@@ -487,7 +674,7 @@ def get_admin_html():
             .status-reset { background: #f85149; color: #fff; }
             .status-rest { background: #8b949e; color: #fff; }
             
-            .form-add { background: #161b22; padding: 20px; border-radius: 10px; margin-bottom: 30px; border: 1px solid #30363d; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; align-items: end; }
+            .form-add { background: #161b22; padding: 20px; border-radius: 10px; margin-bottom: 30px; border: 1px solid #30363d; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; align-items: end; }
             .form-add input { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 10px; border-radius: 6px; width: 100%; }
             .form-add input:focus { border-color: #58a6ff; outline: none; }
             .form-add button { background: #2ea043; border: none; color: #fff; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; height: 42px; }
@@ -517,7 +704,8 @@ def get_admin_html():
             <div class="tabs">
                 <button class="active" onclick="showTab('accounts')">📋 Аккаунты</button>
                 <button onclick="showTab('sales')">💰 Продажи</button>
-                <button onclick="showTab('add')">➕ Добавить аккаунт</button>
+                <button onclick="showTab('logs')">📜 Логи</button>
+                <button onclick="showTab('add')">➕ Добавить</button>
             </div>
             
             <div id="tab-accounts" class="tab-content active">
@@ -565,14 +753,35 @@ def get_admin_html():
                 </div>
             </div>
             
+            <div id="tab-logs" class="tab-content">
+                <button class="refresh-btn" onclick="loadLogs()">🔄 Обновить</button>
+                <div style="overflow-x: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Тип</th>
+                                <th>Чат</th>
+                                <th>Аккаунт</th>
+                                <th>Сообщение</th>
+                                <th>Дата</th>
+                            </tr>
+                        </thead>
+                        <tbody id="logs-table">
+                            <tr><td colspan="6" style="text-align:center;color:#8b949e;">Загрузка...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
             <div id="tab-add" class="tab-content">
                 <div class="form-add">
                     <div><input type="text" id="add-email" placeholder="Почта аккаунта" /></div>
                     <div><input type="text" id="add-password" placeholder="Пароль от почты" /></div>
-                    <div><input type="text" id="add-imap" placeholder="IMAP сервер (imap.mail.ru)" /></div>
-                    <div><input type="number" id="add-trophies" placeholder="Кубки (0)" value="0" /></div>
-                    <div><input type="number" id="add-price" placeholder="Цена аренды (₽)" value="100" /></div>
-                    <div><input type="number" id="add-rent-hours" placeholder="Часы аренды" value="2" /></div>
+                    <div><input type="text" id="add-imap" placeholder="IMAP сервер" /></div>
+                    <div><input type="number" id="add-trophies" placeholder="Кубки" value="0" min="0" /></div>
+                    <div><input type="number" id="add-price" placeholder="Цена" value="100" min="1" /></div>
+                    <div><input type="number" id="add-rent-hours" placeholder="Часы" value="2" min="1" /></div>
                     <div><button onclick="addAccount()">➕ Добавить аккаунт</button></div>
                 </div>
                 <div id="add-result" style="margin-top:10px;color:#3fb950;"></div>
@@ -587,6 +796,7 @@ def get_admin_html():
                 document.querySelector(`.tabs button[onclick="showTab('${name}')"]`).classList.add('active');
                 if (name === 'accounts') loadAccounts();
                 if (name === 'sales') loadSales();
+                if (name === 'logs') loadLogs();
             }
             
             async function loadStats() {
@@ -649,6 +859,28 @@ def get_admin_html():
                 } catch(e) { console.error(e); }
             }
             
+            async function loadLogs() {
+                try {
+                    const res = await fetch('/api/logs');
+                    const data = await res.json();
+                    const tbody = document.getElementById('logs-table');
+                    if (!data.length) {
+                        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#8b949e;">Нет логов</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = data.map(l => `
+                        <tr>
+                            <td>${l.id}</td>
+                            <td>${l.event_type}</td>
+                            <td style="font-size:11px;">${l.chat_id}</td>
+                            <td>${l.account_id}</td>
+                            <td style="font-size:12px;">${l.message}</td>
+                            <td style="font-size:12px;">${l.created_at}</td>
+                        </tr>
+                    `).join('');
+                } catch(e) { console.error(e); }
+            }
+            
             async function addAccount() {
                 const data = {
                     email: document.getElementById('add-email').value.trim(),
@@ -660,6 +892,11 @@ def get_admin_html():
                 };
                 if (!data.email || !data.password || !data.imap_server) {
                     document.getElementById('add-result').textContent = '❌ Заполните все поля!';
+                    document.getElementById('add-result').style.color = '#f85149';
+                    return;
+                }
+                if (data.trophies < 0 || data.price <= 0 || data.rent_hours <= 0) {
+                    document.getElementById('add-result').textContent = '❌ Проверьте значения (цена и часы должны быть > 0)';
                     document.getElementById('add-result').style.color = '#f85149';
                     return;
                 }
@@ -688,20 +925,16 @@ def get_admin_html():
             async function deleteAccount(id) {
                 if (!confirm('Удалить аккаунт ID ' + id + '?')) return;
                 try {
-                    const res = await fetch('/api/account/delete', {
+                    await fetch('/api/account/delete', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({id: id})
                     });
-                    const result = await res.json();
-                    if (result.success) {
-                        loadStats();
-                        loadAccounts();
-                    }
+                    loadStats();
+                    loadAccounts();
                 } catch(e) { console.error(e); }
             }
             
-            // Автообновление каждые 30 секунд
             loadStats();
             loadAccounts();
             setInterval(() => { loadStats(); }, 30000);
@@ -721,62 +954,18 @@ def run_admin_server():
         logger.error(f"Не удалось запустить админ панель: {e}")
 
 # =============================================================================
-# PAYGAME SEND
-# =============================================================================
-def send_to_paygame(chat_id: str, text: str) -> bool:
-    url = f"https://paygame.ru{chat_id}/messages"
-    try:
-        res = PAYGAME_HTTP_SESSION.post(url, json={"message": text}, timeout=10)
-        if res.status_code == 200:
-            return True
-        logger.error(f"Ошибка Paygame API. Статус: {res.status_code}")
-        return False
-    except Exception:
-        logger.exception("Исключение при отправке запроса к Paygame API")
-        return False
-
-# =============================================================================
-# AI ASSISTANT
-# =============================================================================
-def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) -> str:
-    if not ai_client:
-        return "Извините, я автоматический бот. Пожалуйста, следуйте инструкциям выше."
-    
-    system_prompt = """
-Ты — вежливый ИИ-ассистент автоматического сервиса аренды аккаунтов на Paygame.
-Ты помогаешь покупателю войти в игровой профиль.
-
-СТРОЖАЙШЕЕ ОГРАНИЧЕНИЕ ТЕМАТИКИ:
-1. Отвечай ТОЛЬКО на вопросы о заказе, аренде, вводе почты или получении кода.
-2. Если покупатель флудит — ответь: 'Извините, я умею отвечать только на технические вопросы по заказу.'
-3. Ты НЕ знаешь кодов и паролей. Не выдумывай их.
-4. Отвечай максимум 2 предложения.
-
-ТЕКУЩИЙ СТАТУС ЗАКАЗА: [{status}]
-    """.format(status=current_bot_status)
-    
-    try:
-        response = ai_client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": buyer_message}
-            ],
-            timeout=10,
-            temperature=0.1
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Ошибка DeepSeek API: {e}")
-        return "Я зафиксировал ваш вопрос. Администратор ответит вам в ближайшее время."
-
-# =============================================================================
-# BOT LOGIC (сокращено для читаемости, основные функции)
+# BOT LOGIC
 # =============================================================================
 def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[int] = None, target_trophies: Optional[int] = None):
-    """Выделяет аккаунт покупателю"""
     try:
         with db_connection() as conn:
+            # Проверка лимита покупок на день
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM sales WHERE chat_id = %s AND DATE(sold_at) = CURDATE()", (chat_id,))
+                if cursor.fetchone()[0] >= DAILY_PURCHASE_LIMIT:
+                    send_to_paygame(chat_id, f"❌ Вы уже купили {DAILY_PURCHASE_LIMIT} аккаунтов сегодня. Лимит исчерпан.")
+                    return
+            
             with conn.cursor() as check_cursor:
                 if not exclude_account_id:
                     check_cursor.execute("SELECT id FROM accounts WHERE chat_id = %s AND status IN (%s, %s)", 
@@ -788,6 +977,7 @@ def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[i
             conn.start_transaction(isolation_level='READ COMMITTED')
             with conn.cursor(dictionary=True) as cursor:
                 if exclude_account_id and target_trophies is not None:
+                    target_trophies = target_trophies or 0
                     min_trophies = int(target_trophies * 0.8)
                     max_trophies = int(target_trophies * 1.2)
                     cursor.execute("""
@@ -810,10 +1000,11 @@ def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[i
                     logger.critical(f"Нет свободных аккаунтов для чата {chat_id}")
                     send_to_paygame(chat_id, "Извините, все аккаунты заняты. Подождите.")
                     send_telegram_notification(f"⚠️ Закончились аккаунты! Чат: {chat_id}")
+                    log_event("stock_empty", chat_id, None, "Нет свободных аккаунтов")
                     conn.rollback()
                     return
                 
-                if not all([account['email_password'], account['imap_server']]):
+                if not account.get('email') or not account.get('email_password') or not account.get('imap_server'):
                     logger.error(f"Битый аккаунт ID {account['id']} пропущен.")
                     conn.rollback()
                     return
@@ -828,9 +1019,9 @@ def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[i
                            f"Нажмите отправку кода. Бот перехватит его и пришлет сюда.")
             send_to_paygame(chat_id, instruction)
             
-            send_telegram_notification(f"💰 Продажа!\nЧат: {chat_id}\nАккаунт: {mask_email(account['email'])} ({account['trophies']}🏆) {account['price']}₽")
+            send_telegram_notification(f"💰 Продажа!\nЧат: {chat_id}\nАккаунт: {mask_email(account['email'])} ({account['trophies']}🏆)")
+            log_event("sale", chat_id, account['id'], f"{mask_email(account['email'])} ({account['trophies']}🏆)")
             
-            # Запись в продажи
             with db_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
@@ -839,105 +1030,280 @@ def allocate_account_and_start_idle(chat_id: str, exclude_account_id: Optional[i
                     """, (chat_id, account['id'], account['email'], account['trophies'], account['price'], account['rent_hours']))
                     conn.commit()
             
-            # Запуск IDLE потока
-            threading.Thread(
-                target=instant_code_waiter,
-                args=(account['id'], account['email'], account['email_password'], account['imap_server'], chat_id, account['trophies']),
-                daemon=True
-            ).start()
+            idle_thread_pool.submit(
+                instant_code_waiter,
+                account['id'], account['email'], account['email_password'], 
+                account['imap_server'], chat_id, account['trophies']
+            )
             
     except Exception as e:
         logger.exception(f"Ошибка выделения аккаунта: {e}")
+        log_event("error", chat_id, None, str(e))
 
 def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_server: str, chat_id: str, trophies: int):
-    """Ждет код на почте"""
-    logger.info(f"IDLE поток для {mask_email(user_email)}")
+    logger.info(f"Запущен IDLE поток для {mask_email(user_email)}")
     code_pattern = re.compile(CODE_REGEX_PATTERN)
     timeout_minutes = 5
     start_time = datetime.now()
+    code_received = False
     
     while not SHUTDOWN_EVENT.is_set():
-        if datetime.now() - start_time > timedelta(minutes=timeout_minutes):
-            send_to_paygame(chat_id, "⏰ Время ожидания кода истекло. Бот подберет другой аккаунт...")
-            send_account_to_rest(account_id)
-            allocate_account_and_start_idle(chat_id, exclude_account_id=account_id, target_trophies=trophies)
+        if datetime.now() - start_time > timedelta(minutes=timeout_minutes) and not code_received:
+            send_to_paygame(chat_id, "⏰ Код не пришел. Предлагаю аналогичный аккаунт с близкими кубками.")
+            
+            with db_connection() as conn:
+                with conn.cursor(dictionary=True) as cursor:
+                    target_trophies = trophies or 0
+                    min_trophies = int(target_trophies * 0.8)
+                    max_trophies = int(target_trophies * 1.2)
+                    cursor.execute("""
+                        SELECT id FROM accounts 
+                        WHERE status = %s AND trophies BETWEEN %s AND %s 
+                        LIMIT 1
+                    """, (STATUS_FREE, min_trophies, max_trophies))
+                    replacement = cursor.fetchone()
+            
+            if replacement:
+                send_to_paygame(chat_id, "🎮 Найден аналогичный аккаунт. Заменяю...")
+                log_event("replacement", chat_id, account_id, "Замена аккаунта")
+                allocate_account_and_start_idle(chat_id, exclude_account_id=account_id, target_trophies=trophies)
+            else:
+                send_to_paygame(chat_id, "💳 Аналогичных аккаунтов нет. Возврат средств в течение 24 часов.")
+                send_account_to_rest(account_id)
             return
         
         try:
             with MailBox(imap_server, timeout=15).login(user_email, user_pass, 'INBOX') as mailbox:
-                for msg in mailbox.fetch('(UNSEEN)'):
-                    raw = f"{msg.subject} {msg.text} {msg.html}"
-                    decoded = html.unescape(raw)
-                    match = code_pattern.search(decoded) or code_pattern.search(raw)
+                for msg in mailbox.idle(wait_timeout=5):
+                    if SHUTDOWN_EVENT.is_set():
+                        break
+                    
+                    if '\\Seen' in msg.flags:
+                        continue
+                    
+                    raw_search_area = f"{msg.subject} {msg.text} {msg.html}"
+                    decoded_search_area = html.unescape(raw_search_area)
+                    match = code_pattern.search(decoded_search_area) or code_pattern.search(raw_search_area)
+                    
                     if match:
                         code = match.group(0)
-                        logger.info(f"Код {code} получен для чата {chat_id}")
-                        send_to_paygame(chat_id, f"🔑 Ваш код: {code}\n\nАренда на {RENT_DURATION_HOURS} ч. активирована!")
+                        code_received = True
+                        logger.info(f"✅ Код {code} перехвачен для чата {chat_id}")
+                        
+                        send_to_paygame(chat_id, f"🔑 Ваш код: {code}\n\n✅ Вход выполнен! Время аренды ({RENT_DURATION_HOURS} ч.) пошло.\n\n🎮 Удачной игры!\n⭐ Оцените наш сервис 5 звезд!")
                         mailbox.flag(msg.uid, 'SEEN', True)
                         
                         with db_connection() as conn:
                             with conn.cursor() as cursor:
                                 end_rent_time = datetime.now() + timedelta(hours=RENT_DURATION_HOURS)
-                                cursor.execute("UPDATE accounts SET status = %s, rent_end_time = %s WHERE id = %s",
-                                             (STATUS_IN_RENT, end_rent_time, account_id))
+                                cursor.execute("""
+                                    UPDATE accounts 
+                                    SET status = %s, rent_end_time = %s 
+                                    WHERE id = %s
+                                """, (STATUS_IN_RENT, end_rent_time, account_id))
                                 conn.commit()
                         
                         send_telegram_notification(f"🔑 Код выдан!\nЧат: {chat_id}\nКод: {code}")
+                        log_event("code_delivered", chat_id, account_id, f"Код: {code}")
+                        
+                        remaining = RENT_DURATION_HOURS * 3600
+                        while remaining > 0 and not SHUTDOWN_EVENT.is_set():
+                            time.sleep(10)
+                            remaining -= 10
+                            with db_connection() as conn:
+                                with conn.cursor(dictionary=True) as cursor:
+                                    cursor.execute("SELECT status FROM accounts WHERE id = %s", (account_id,))
+                                    acc = cursor.fetchone()
+                                    if acc and acc['status'] != STATUS_IN_RENT:
+                                        logger.info(f"Аккаунт {user_email} уже не в аренде")
+                                        return
+                        
+                        if SHUTDOWN_EVENT.is_set():
+                            return
+                        
+                        logout_success = trigger_logout_session(user_email, user_pass, imap_server)
+                        
+                        if logout_success:
+                            send_to_paygame(chat_id, f"⏰ Время аренды ({RENT_DURATION_HOURS} ч.) истекло. Сессия завершена.\n⭐ Оцените нашу работу! Покупайте у нас еще! 🚀")
+                            reset_account_to_free(account_id)
+                            send_telegram_notification(f"⏰ Аренда завершена: {mask_email(user_email)}")
+                            log_event("rental_ended", chat_id, account_id, "Успешный выход")
+                        else:
+                            send_to_paygame(chat_id, "⚠️ Не удалось автоматически выйти. Выйдите вручную.")
+                            update_account_status(account_id, STATUS_MANUAL_RESET)
+                            send_telegram_notification(f"🚨 Требуется ручной сброс: {mask_email(user_email)}")
+                            log_event("manual_reset_needed", chat_id, account_id, "Автоматический выход не удался")
+                        
                         return
+                        
         except Exception as e:
             logger.warning(f"Ошибка IDLE для {mask_email(user_email)}: {e}")
             time.sleep(5)
+            continue
 
 def send_account_to_rest(account_id: int):
     try:
         with db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("UPDATE accounts SET status = %s, rest_until = NOW() + INTERVAL 1 DAY WHERE id = %s",
-                             (STATUS_REST, account_id))
+                rest_until_time = datetime.now() + timedelta(days=2)
+                cursor.execute("UPDATE accounts SET status = %s, rest_until = %s WHERE id = %s",
+                             (STATUS_REST, rest_until_time, account_id))
                 conn.commit()
+                logger.info(f"Аккаунт ID {account_id} отправлен на отдых до {rest_until_time}")
+                log_event("account_rest", None, account_id, f"Отдых до {rest_until_time}")
     except Exception as e:
         logger.error(f"Ошибка отправки в REST: {e}")
 
-# =============================================================================
-# MAIN
-# =============================================================================
-def main():
-    logger.info("🚀 Запуск бота...")
-    
-    required_vars = {
-        "MASTER_EMAIL": MASTER_EMAIL,
-        "MASTER_PASSWORD": MASTER_PASSWORD,
-        "IMAP_MASTER_SERVER": IMAP_MASTER_SERVER,
-        "PAYGAME_SESSION": PAYGAME_SESSION,
-    }
-    missing = [k for k, v in required_vars.items() if not v]
-    if missing:
-        logger.critical(f"❌ Отсутствуют переменные: {', '.join(missing)}")
-        return
-    
-    if not db_pool:
-        logger.critical("❌ Нет подключения к БД")
-        return
-    
-    initialize_database()
-    
-    # Запуск админ панели
-    threading.Thread(target=run_admin_server, name="AdminPanel", daemon=True).start()
-    
-    # Запуск остальных потоков
-    threading.Thread(target=railway_self_pinger, name="Pinger", daemon=True).start()
-    
-    send_telegram_notification("🚀 Бот запущен! Админ панель: " + (RAILWAY_PUBLIC_URL or "http://localhost:8080"))
-    logger.info("✅ Бот успешно запущен!")
-    
+def reset_account_to_free(account_id: int):
     try:
-        while not SHUTDOWN_EVENT.is_set():
-            SHUTDOWN_EVENT.wait(timeout=1.0)
-    except KeyboardInterrupt:
-        SHUTDOWN_EVENT.set()
-    
-    logger.info("Бот остановлен.")
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("UPDATE accounts SET status = %s, chat_id = NULL, rent_end_time = NULL, rest_until = NULL WHERE id = %s",
+                             (STATUS_FREE, account_id))
+                conn.commit()
+                log_event("account_reset", None, account_id, "Сброшен в FREE")
+    except Exception as e:
+        logger.error(f"Ошибка сброса аккаунта: {e}")
 
+def update_account_status(account_id: int, status: int):
+    try:
+        with db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("UPDATE accounts SET status = %s WHERE id = %s", (status, account_id))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка обновления статуса: {e}")
+
+def trigger_logout_session(user, pwd, server) -> bool:
+    with requests.Session() as session:
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+        })
+        try:
+            with MailBox(server, timeout=15).login(user, pwd, 'INBOX') as mailbox:
+                for msg in reversed(list(mailbox.fetch(limit=20))):
+                    text_to_search = html.unescape(f"{msg.subject} {msg.text} {msg.html}")
+                    logout_links = re.findall(LOGOUT_LINK_PATTERN, text_to_search, re.IGNORECASE)
+                    if logout_links:
+                        target_url = clean_extracted_url(logout_links[0])
+                        logger.info(f"Найдена ссылка выхода: {target_url}")
+                        try:
+                            response = session.get(target_url, timeout=15, allow_redirects=True)
+                            if response.status_code in [200, 302, 301]:
+                                logger.info(f"Выход выполнен для {mask_email(user)}")
+                                return True
+                        except Exception as e:
+                            logger.warning(f"Ошибка перехода по ссылке: {e}")
+            return False
+        except Exception as e:
+            logger.exception(f"Ошибка выхода для {mask_email(user)}: {e}")
+            return False
+
+# =============================================================================
+# WATCHDOG
+# =============================================================================
+def watchdog_and_timer_thread():
+    logger.info("Поток Watchdog и контроля таймеров аренды запущен.")
+    while not SHUTDOWN_EVENT.is_set():
+        try:
+            with db_connection() as conn:
+                with conn.cursor(dictionary=True) as cursor:
+                    cursor.execute("SELECT * FROM accounts WHERE status = %s AND rent_end_time <= NOW()", (STATUS_IN_RENT,))
+                    expired_accounts = cursor.fetchall()
+                    for acc in expired_accounts:
+                        if acc['status'] != STATUS_IN_RENT:
+                            continue
+                        logger.info(f"Срок аренды аккаунта {mask_email(acc['email'])} истек.")
+                        try:
+                            logout_success = trigger_logout_session(acc['email'], acc['email_password'], acc['imap_server'])
+                        except Exception as e:
+                            logger.error(f"Ошибка выхода для {mask_email(acc['email'])}: {e}")
+                            logout_success = False
+                        
+                        if logout_success:
+                            reset_account_to_free(acc['id'])
+                            send_to_paygame(acc['chat_id'], "⏰ Время аренды истекло. Доступ закрыт.\n⭐ Оцените нашу работу!")
+                            send_telegram_notification(f"⏰ Аренда завершена: {mask_email(acc['email'])}")
+                            log_event("rental_expired", acc['chat_id'], acc['id'], "Автоматический выход")
+                        else:
+                            update_account_status(acc['id'], STATUS_MANUAL_RESET)
+                            send_telegram_notification(f"🚨 Требуется ручной сброс: {mask_email(acc['email'])}")
+                            log_event("manual_reset_needed", acc['chat_id'], acc['id'], "Выход не удался")
+        except Exception as e:
+            logger.exception(f"Ошибка в watchdog: {e}")
+        
+        try:
+            with db_connection() as conn:
+                with conn.cursor(dictionary=True) as cursor:
+                    cursor.execute("SELECT id, email FROM accounts WHERE status = %s AND rest_until <= NOW()", (STATUS_REST,))
+                    rested_accounts = cursor.fetchall()
+                    for acc in rested_accounts:
+                        logger.info(f"Отдых для {mask_email(acc['email'])} завершен.")
+                        reset_account_to_free(acc['id'])
+                        send_telegram_notification(f"♻️ Аккаунт вышел из отдыха: {mask_email(acc['email'])}")
+                        log_event("rest_ended", None, acc['id'], "Отдых завершен")
+        except Exception as e:
+            logger.exception(f"Ошибка возврата аккаунтов из отдыха: {e}")
+        
+        SHUTDOWN_EVENT.wait(POLL_INTERVAL)
+
+# =============================================================================
+# SALES LISTENER
+# =============================================================================
+def sales_listener_thread():
+    logger.info("Поток мониторинга продаж запущен.")
+    while not SHUTDOWN_EVENT.is_set():
+        try:
+            with MailBox(IMAP_MASTER_SERVER, timeout=15).login(MASTER_EMAIL, MASTER_PASSWORD, 'INBOX') as mailbox:
+                for msg in mailbox.idle(wait_timeout=5):
+                    if SHUTDOWN_EVENT.is_set():
+                        break
+                    
+                    body = msg.text or msg.html or ""
+                    sender = msg.from_ or ""
+                    
+                    if "noreply@paygame.ru" in sender.lower():
+                        match = re.search(r"chats/(\d+)", body)
+                        if match:
+                            chat_id = match.group(1)
+                            logger.info(f"Новая продажа! Чат: {chat_id}")
+                            log_event("new_sale", chat_id, None, "Получено уведомление о продаже")
+                            allocate_account_and_start_idle(chat_id)
+                            mailbox.flag(msg.uid, 'SEEN', True)
+                    
+                    elif "сообщение" in body.lower() or "message" in body.lower():
+                        chat_match = re.search(r"chats/(\d+)", body)
+                        if chat_match:
+                            chat_id = chat_match.group(1)
+                            buyer_text = re.search(r"Покупатель:\s*(.*)", body)
+                            buyer_text = buyer_text.group(1) if buyer_text else "Вопрос по аккаунту"
+                            
+                            with db_connection() as conn:
+                                with conn.cursor(dictionary=True) as cursor:
+                                    cursor.execute("SELECT status, email FROM accounts WHERE chat_id = %s", (chat_id,))
+                                    acc_info = cursor.fetchone()
+                            
+                            status_desc = "Оплата не подтверждена. Задайте вопрос до покупки."
+                            if acc_info:
+                                if acc_info['status'] == STATUS_WAIT_CODE:
+                                    status_desc = f"Ожидание кода для {mask_email(acc_info['email'])}"
+                                elif acc_info['status'] == STATUS_IN_RENT:
+                                    status_desc = f"Активна аренда {mask_email(acc_info['email'])}"
+                            
+                            ai_reply = ask_ai_assistant(chat_id, buyer_text, status_desc)
+                            send_to_paygame(chat_id, f"🤖 {ai_reply}")
+                            mailbox.flag(msg.uid, 'SEEN', True)
+                            
+        except Exception as e:
+            logger.exception(f"Ошибка мониторинга продаж: {e}")
+        if SHUTDOWN_EVENT.is_set():
+            break
+        SHUTDOWN_EVENT.wait(POLL_INTERVAL)
+
+# =============================================================================
+# RAILWAY SELF PINGER
+# =============================================================================
 def railway_self_pinger():
     if not RAILWAY_PUBLIC_URL:
         return
@@ -947,8 +1313,51 @@ def railway_self_pinger():
         except:
             pass
         for _ in range(240):
-            if SHUTDOWN_EVENT.is_set(): break
+            if SHUTDOWN_EVENT.is_set():
+                break
             time.sleep(1)
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def main():
+    logger.info("🚀 Запуск профессионального бота...")
+    
+    required_vars = {
+        "MASTER_EMAIL": MASTER_EMAIL,
+        "MASTER_PASSWORD": MASTER_PASSWORD,
+        "IMAP_MASTER_SERVER": IMAP_MASTER_SERVER,
+        "PAYGAME_SESSION": PAYGAME_SESSION,
+    }
+    missing = [k for k, v in required_vars.items() if not v or v in ["ВСТАВЬТЕ_СЮДА", "ВСТАВЬТЕ_СЮДА_ЗНАЧЕНИЕ_COOKIE_SESSION"]]
+    if missing:
+        logger.critical(f"❌ Отсутствуют или невалидны переменные: {', '.join(missing)}")
+        return
+    
+    if not db_pool:
+        logger.critical("❌ Нет подключения к БД")
+        return
+    
+    verify_paygame_session()
+    initialize_database()
+    
+    threading.Thread(target=run_admin_server, name="AdminPanel", daemon=True).start()
+    threading.Thread(target=railway_self_pinger, name="Pinger", daemon=True).start()
+    threading.Thread(target=sales_listener_thread, name="SalesListener", daemon=True).start()
+    threading.Thread(target=watchdog_and_timer_thread, name="Watchdog", daemon=True).start()
+    threading.Thread(target=clear_old_ai_history, name="AICleaner", daemon=True).start()
+    
+    send_telegram_notification("🚀 Профессиональный бот запущен! Админ панель: " + (RAILWAY_PUBLIC_URL or "http://localhost:8080"))
+    logger.info("✅ Бот успешно запущен!")
+    
+    try:
+        while not SHUTDOWN_EVENT.is_set():
+            SHUTDOWN_EVENT.wait(timeout=1.0)
+    except KeyboardInterrupt:
+        SHUTDOWN_EVENT.set()
+    
+    idle_thread_pool.shutdown(wait=False)
+    logger.info("Бот остановлен.")
 
 if __name__ == "__main__":
     main()
