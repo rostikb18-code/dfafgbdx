@@ -38,10 +38,10 @@ logger.addHandler(file_handler)
 # =============================================================================
 # CONFIG
 # =============================================================================
-DATABASE_URL = os.environ.get("mysql://railway:DGoDqbSoxOT1BKjmTGnRtIPJCvxEObjF@autorack.proxy.rlwy.net:27376/railway") or os.environ.get("MYSQL_URL")
-RAILWAY_PUBLIC_URL = os.environ.get("https://твой-проект.railway.app")
-TELEGRAM_BOT_TOKEN = os.environ.get("8463208306:AAEm-9QmIJbkQFzU6ubI3KGRSR82TaLEG28")
-TELEGRAM_ADMIN_CHAT_ID = os.environ.get("6658014493")
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL")
+RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
 
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 5
@@ -86,11 +86,11 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 # =============================================================================
 # ENV VARIABLES
 # =============================================================================
-MASTER_EMAIL = os.environ.get("mhqizxqg@bekommenmail.com")
-MASTER_PASSWORD = os.environ.get("12346789")
-IMAP_MASTER_SERVER = os.environ.get("bekommenmail.com", "imap.mail.ru")
-PAYGAME_SESSION = os.environ.get("uHC4EvIUTBhxPMRqWs7S")
-OPENAI_API_KEY = os.environ.get("sk-186bc12cbf4d44d3be9abbbe6bec499c")
+MASTER_EMAIL = os.environ.get("MASTER_EMAIL")
+MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD")
+IMAP_MASTER_SERVER = os.environ.get("IMAP_MASTER_SERVER", "imap.mail.ru")
+PAYGAME_SESSION = os.environ.get("PAYGAME_SESSION")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # =============================================================================
 # AI
