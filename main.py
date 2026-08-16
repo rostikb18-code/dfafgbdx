@@ -10,20 +10,19 @@ from contextlib import contextmanager
 from typing import Optional, Dict
 from urllib.parse import urlparse, unquote
 
-import pymysql
-from pymysql.cursors import DictCursor
+# Использование стабильного официального драйвера
+import mysql.connector
 
 # =============================================================================
-# CONFIG (ПАРСИНГ MYSQL_URL ИЗ ПЕРЕМЕННЫХ RAILWAY)
+# CONFIG (ЖЕЛЕЗОБЕТОННАЯ СОВМЕСТИМОСТЬ С ЛЮБЫМИ СЕРВЕРАМИ MYSQL 8/9)
 # =============================================================================
 
 DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL")
 
 
 def get_db_config() -> dict:
-    """Профессионально парсит системную URL-строку Railway и адаптирует под MySQL"""
+    """Парсит системную строку URL и добавляет параметры сквозного SSL-обхода"""
     if not DATABASE_URL:
-        # Резервный публичный коннект, если системная переменная не подтянулась
         return {
             "host": "autorack.proxy.rlwy.net",
             "user": "railway",
@@ -32,6 +31,7 @@ def get_db_config() -> dict:
             "port": 27376,
             "charset": "utf8mb4",
             "autocommit": False,
+            "ssl_disabled": True,
         }
 
     try:
@@ -44,6 +44,8 @@ def get_db_config() -> dict:
             "port": parsed.port if parsed.port else 3306,
             "charset": "utf8mb4",
             "autocommit": False,
+            "ssl_disabled": True,
+            "auth_plugin": "mysql_native_password",
         }
     except Exception as parse_err:
         raise ValueError(f"Критическая ошибка разбора строки DATABASE_URL: {parse_err}")
@@ -52,12 +54,10 @@ def get_db_config() -> dict:
 POLL_INTERVAL = 15
 DB_RETRIES = 3
 
-# Настройки для интеграции с почтой уведомлений площадки PayGame
 MASTER_EMAIL = "mhqizxqg@bekommenmail.com"
 MASTER_PASSWORD = "12346789"
 IMAP_MASTER_SERVER = "bekommenmail.com"  # Без ://
 
-# Ключ авторизации (session) автоматически подтянется из вкладки Variables на Railway
 PAYGAME_SESSION = os.getenv("PAYGAME_SESSION", "uHC4EvIUTBhxPMRqWs7S")
 PAYGAME_COOKIES = {"session": PAYGAME_SESSION}
 HEADERS = {
@@ -127,7 +127,7 @@ def db_connection():
     connection = None
     try:
         config = get_db_config()
-        connection = pymysql.connect(**config)
+        connection = mysql.connector.connect(**config)
         yield connection
     except Exception:
         if connection:
@@ -164,7 +164,7 @@ def reserve_and_get_account() -> Optional[Dict[str, str]]:
     for attempt in range(DB_RETRIES):
         try:
             with db_connection() as connection:
-                with connection.cursor(DictCursor) as cursor:
+                with connection.cursor() as cursor:
                     cursor.execute(
                         """
                         SELECT id, `mhqizxqq@bekommenmail.com`, `1account1`
@@ -180,13 +180,13 @@ def reserve_and_get_account() -> Optional[Dict[str, str]]:
                     if account:
                         cursor.execute(
                             "UPDATE account SET status = %s WHERE id = %s",
-                            (ACCOUNT_RESERVED, account["id"]),
+                            (ACCOUNT_RESERVED, account[0]),
                         )
                         connection.commit()
                         return {
-                            "id": account["id"],
-                            "email": account["mhqizxqq@bekommenmail.com"],
-                            "password": account["1account1"],
+                            "id": account[0],
+                            "email": account[1],
+                            "password": account[2],
                         }
                     return None
         except Exception as e:
