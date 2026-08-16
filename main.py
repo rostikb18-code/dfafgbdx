@@ -18,7 +18,7 @@ from pymysql.cursors import DictCursor
 
 DB_CONFIG = {
     "host": "autorack.proxy.rlwy.net",
-    "user": "root",
+    "user": "railway",
     "password": "DGoDqbSoxOT1BKjmTGnRtIPJCvxEObjF",
     "database": "railway",
     "port": 27376,
@@ -88,8 +88,6 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 # =============================================================================
 # HELPERS
 # =============================================================================
-
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def mask_email(value: str) -> str:
@@ -213,7 +211,15 @@ def check_paygame_sales() -> Optional[str]:
         if status == "OK" and messages:
             for msg_id in messages[0].split():
                 _, data = mail.fetch(msg_id, "(RFC822)")
-                msg = email.message_from_bytes(data[0][1])
+
+                # data — это кортеж: (b'...', b'...')
+                # Берём вторую часть, где само письмо
+                if isinstance(data, tuple) and len(data) > 0:
+                    msg_data = data[0][1] if isinstance(data[0], tuple) else data[0]
+                else:
+                    continue
+
+                msg = email.message_from_bytes(msg_data)
 
                 body = ""
                 if msg.is_multipart():
@@ -294,7 +300,13 @@ def listen_for_code(email_addr: str, password: str) -> Optional[str]:
             if status == "OK" and messages:
                 latest_id = messages[0].split()[-1]
                 _, data = mail.fetch(latest_id, "(RFC822)")
-                msg = email.message_from_bytes(data[0][1])
+
+                if isinstance(data, tuple) and len(data) > 0:
+                    msg_data = data[0][1] if isinstance(data[0], tuple) else data[0]
+                else:
+                    continue
+
+                msg = email.message_from_bytes(msg_data)
 
                 body = ""
                 if msg.is_multipart():
