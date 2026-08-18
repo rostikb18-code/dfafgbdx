@@ -8,7 +8,6 @@ import html
 import requests
 import json
 import sqlite3
-import base64
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -17,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 
 import openai
-from imap_tools import MailBox, MailBoxIdler
+from imap_tools import MailBox
 
 # =============================================================================
 # LOGGING
@@ -122,6 +121,16 @@ def initialize_database():
             )
         """)
         
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blacklist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL UNIQUE,
+                reason TEXT DEFAULT NULL,
+                permanent INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         conn.commit()
         logger.info("✅ База данных SQLite успешно инициализирована.")
 
@@ -147,6 +156,28 @@ def log_event(event_type: str, chat_id: Optional[str] = None, account_id: Option
             conn.commit()
     except Exception:
         logger.exception("Ошибка записи лога")
+
+# =============================================================================
+# BLACKLIST
+# =============================================================================
+def is_chat_blacklisted(chat_id: str) -> bool:
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM blacklist WHERE chat_id = ?", (chat_id,))
+            return cursor.fetchone() is not None
+    except Exception:
+        return False
+
+def add_to_blacklist(chat_id: str, reason: str = "Нарушение правил", permanent: bool = False):
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO blacklist (chat_id, reason, permanent) VALUES (?, ?, ?)",
+                         (chat_id, reason, 1 if permanent else 0))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка добавления в черный список: {e}")
 
 # =============================================================================
 # SHUTDOWN
@@ -206,7 +237,6 @@ PAYGAME_ORDERS_URL = f"{PAYGAME_API_BASE}/orders"
 PAYGAME_LISTINGS_URL = f"{PAYGAME_API_BASE}/listings"
 
 def get_paygame_orders():
-    """Получает новые заказы через API Paygame"""
     try:
         response = PAYGAME_HTTP_SESSION.get(PAYGAME_ORDERS_URL, timeout=10)
         if response.status_code == 200:
@@ -230,7 +260,6 @@ def get_paygame_orders():
         return []
 
 def get_listing_details(listing_id: str):
-    """Получает детали объявления"""
     try:
         response = PAYGAME_HTTP_SESSION.get(f"{PAYGAME_LISTINGS_URL}/{listing_id}", timeout=10)
         if response.status_code == 200:
@@ -251,7 +280,6 @@ def get_listing_details(listing_id: str):
         return None
 
 def create_listing(account_data: dict):
-    """Создаёт новое объявление на Paygame"""
     try:
         payload = {
             "title": f"Brawl Stars аккаунт | {account_data['trophies']}🏆 | {account_data['brawlers_count']} бойцов",
@@ -275,7 +303,6 @@ def create_listing(account_data: dict):
         return None
 
 def update_listing(listing_id: str, account_data: dict):
-    """Обновляет существующее объявление"""
     try:
         payload = {
             "title": f"Brawl Stars аккаунт | {account_data['trophies']}🏆 | {account_data['brawlers_count']} бойцов",
@@ -297,7 +324,6 @@ def update_listing(listing_id: str, account_data: dict):
         return False
 
 def republish_listing(account_id: int):
-    """Переопубликовывает объявление после отдыха"""
     try:
         with db_connection() as conn:
             cursor = conn.cursor()
@@ -318,9 +344,9 @@ def republish_listing(account_id: int):
                 'photos': json.loads(acc[8]) if acc[8] else []
             }
             
-            if acc[7]:  # Если есть listing_id — обновляем
+            if acc[7]:
                 success = update_listing(acc[7], account_data)
-            else:  # Иначе создаём новое
+            else:
                 new_listing_id = create_listing(account_data)
                 if new_listing_id:
                     cursor.execute("UPDATE accounts SET listing_id = ? WHERE id = ?", (new_listing_id, account_id))
@@ -338,7 +364,6 @@ def republish_listing(account_id: int):
         return False
 
 def mark_order_processed(order_id: str):
-    """Отмечает заказ как обработанный"""
     try:
         response = PAYGAME_HTTP_SESSION.post(f"{PAYGAME_ORDERS_URL}/{order_id}/process", timeout=10)
         return response.status_code == 200
@@ -363,7 +388,7 @@ def get_brawl_stats(player_tag: str):
                 "trophies": data.get("trophies", 0),
                 "highestTrophies": data.get("highestTrophies", 0),
                 "brawlers_count": len(data.get("brawlers", [])),
-                "gems": 0  # API не даёт гемы
+                "gems": 0
             }
         return None
     except Exception as e:
@@ -433,6 +458,9 @@ def send_telegram_notification(text: str):
 # =============================================================================
 def send_to_paygame(chat_id: str, text: str, retries: int = MAX_RETRY_ATTEMPTS) -> bool:
     if not chat_id:
+        return False
+    if is_chat_blacklisted(chat_id):
+        send_to_paygame(chat_id, "🚫 Вы в черном списке. Обратитесь к администратору.")
         return False
     url = f"https://paygame.ru{chat_id}/messages"
     for attempt in range(retries):
@@ -556,6 +584,31 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'success': result}).encode('utf-8'))
+        elif self.path == '/api/blacklist/add':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            result = add_to_blacklist(data.get('chat_id'), data.get('reason'), data.get('permanent', False))
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': result}).encode('utf-8'))
+        elif self.path == '/api/blacklist/remove':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            try:
+                with db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM blacklist WHERE chat_id = ?", (data.get('chat_id'),))
+                    conn.commit()
+                result = {'success': True}
+            except Exception as e:
+                result = {'success': False, 'error': str(e)}
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
@@ -677,7 +730,6 @@ def add_account(data):
             account_id = cursor.lastrowid
             conn.commit()
             
-            # Создаём объявление
             account_data = {
                 'trophies': trophies,
                 'brawlers_count': 0,
@@ -919,11 +971,13 @@ idle_thread_pool = ThreadPoolExecutor(max_workers=MAX_IDLE_THREADS)
 # =============================================================================
 def allocate_account_and_start_idle(chat_id: str, order_data: dict):
     try:
+        if is_chat_blacklisted(chat_id):
+            send_to_paygame(chat_id, "🚫 Вы в черном списке. Обратитесь к администратору.")
+            return
+            
         rent_days = order_data.get("rent_days", 1)
         if rent_days < 1:
             rent_days = 1
-        
-        rent_hours = rent_days * 24
         
         with db_connection() as conn:
             cursor = conn.cursor()
@@ -974,7 +1028,7 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
     
     while not SHUTDOWN_EVENT.is_set():
         if datetime.now() - start_time > timedelta(minutes=timeout_minutes):
-            send_to_paygame(chat_id, "⏰ Код не пришел. Пожалуйста, проверьте правильность почты и запросите код снова.\n📸 Пришлите скриншот для проверки.")
+            send_to_paygame(chat_id, "⏰ Время ожидания кода истекло.\nЕсли хотите продолжить — обратитесь снова.\nПожалуйста, оставьте отзыв о нашей работе! ⭐")
             return
         
         try:
@@ -988,9 +1042,8 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
                     raw = f"{msg.subject} {msg.text} {msg.html}"
                     decoded = html.unescape(raw)
                     
-                    # ЗАПРЕТ SUPERCELL ID
-                    if "Supercell" in raw or "supercell" in raw or "SuperCell" in raw:
-                        send_to_paygame(chat_id, "⚠️ Это письмо от Supercell ID. Вход разрешён ТОЛЬКО через игру, а не через Supercell ID!")
+                    if "Supercell" in raw or "supercell" in raw:
+                        send_to_paygame(chat_id, "⚠️ Это письмо от Supercell ID. Вход разрешён ТОЛЬКО через игру!")
                         continue
                     
                     match = code_pattern.search(decoded) or code_pattern.search(raw)
@@ -1080,7 +1133,7 @@ def trigger_logout_session(user, pwd, server) -> bool:
             return False
 
 # =============================================================================
-# SALES LISTENER (ЧЕРЕЗ API PAYGAME)
+# SALES LISTENER
 # =============================================================================
 def sales_listener_thread():
     logger.info("Поток мониторинга продаж запущен (Paygame API).")
@@ -1112,7 +1165,6 @@ def sales_listener_thread():
 def watchdog_and_timer_thread():
     logger.info("Поток Watchdog запущен.")
     while not SHUTDOWN_EVENT.is_set():
-        # Проверка истекших аренд
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
@@ -1125,14 +1177,13 @@ def watchdog_and_timer_thread():
                         if acc[4]:
                             update_account_stats(acc[0], acc[4])
                         send_account_to_rest(acc[0])
-                        send_to_paygame(acc[8], f"⏰ Время аренды истекло. Аккаунт ушёл на отдых на {REST_DAYS} день.")
+                        send_to_paygame(acc[8], f"⏰ Время аренды истекло. Аккаунт ушёл на отдых на {REST_DAYS} день.\n⭐ Пожалуйста, оставьте отзыв о нашей работе!")
                     else:
                         update_account_status(acc[0], STATUS_MANUAL_RESET)
                         send_telegram_notification(f"🚨 Требуется ручной сброс: {mask_email(acc[1])}")
         except Exception:
             logger.exception("Ошибка в watchdog")
         
-        # Возврат аккаунтов с отдыха + републикация
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
