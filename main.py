@@ -42,7 +42,7 @@ TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
 BRAWL_STARS_API_KEY = os.environ.get("BRAWL_STARS_API_KEY")
 MASTER_EMAIL = os.environ.get("MASTER_EMAIL")
 MASTER_PASSWORD = os.environ.get("MASTER_PASSWORD")
-IMAP_MASTER_SERVER = os.environ.get("IMAP_MASTER_SERVER", "imap.mail.ru")
+IMAP_MASTER_SERVER = os.environ.get("IMAP_MASTER_SERVER", "bekommenmail.com")
 PAYGAME_SESSION = os.environ.get("PAYGAME_SESSION")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
@@ -315,6 +315,12 @@ def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) 
     if not DEEPSEEK_ENABLED:
         return "Извините, я автоматический бот. Следуйте инструкциям выше."
     
+    with AI_CHAT_HISTORY_LOCK:
+        if chat_id not in AI_CHAT_HISTORY:
+            AI_CHAT_HISTORY[chat_id] = []
+        if len(AI_CHAT_HISTORY[chat_id]) > 10:
+            AI_CHAT_HISTORY[chat_id] = AI_CHAT_HISTORY[chat_id][-10:]
+    
     system_prompt = f"""
 Ты — профессиональный ИИ-ассистент сервиса аренды аккаунтов Brawl Stars на Paygame.
 ТЫ МОЖЕШЬ отвечать на вопросы о времени аренды (2 часа) и процессе.
@@ -322,22 +328,32 @@ def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) 
 ТЕКУЩИЙ СТАТУС ЗАКАЗА: {current_bot_status}
 """
     try:
+        messages = [{"role": "system", "content": system_prompt}]
+        with AI_CHAT_HISTORY_LOCK:
+            messages.extend(AI_CHAT_HISTORY.get(chat_id, [])[-10:])
+        messages.append({"role": "user", "content": buyer_message})
+        
         response = openai.ChatCompletion.create(
             model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": buyer_message}
-            ],
+            messages=messages,
             timeout=10,
             temperature=0.1
         )
-        return response.choices[0].message.content
+        ai_reply = response.choices[0].message.content
+        
+        with AI_CHAT_HISTORY_LOCK:
+            if chat_id not in AI_CHAT_HISTORY:
+                AI_CHAT_HISTORY[chat_id] = []
+            AI_CHAT_HISTORY[chat_id].append({"role": "user", "content": buyer_message, "timestamp": time.time()})
+            AI_CHAT_HISTORY[chat_id].append({"role": "assistant", "content": ai_reply, "timestamp": time.time()})
+        
+        return ai_reply
     except Exception as e:
         logger.error(f"Ошибка DeepSeek API: {e}")
         return "Я зафиксировал ваш вопрос. Администратор ответит вам в ближайшее время."
 
 # =============================================================================
-# WEB ADMIN PANEL (УПРОЩЁННАЯ)
+# WEB ADMIN PANEL
 # =============================================================================
 class AdminPanelHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -799,45 +815,59 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
         
         try:
             with MailBox(imap_server, timeout=15).login(user_email, user_pass, 'INBOX') as mailbox:
-                for msg in mailbox.idle(wait_timeout=5):
-                    if SHUTDOWN_EVENT.is_set():
-                        break
-                    if '\\Seen' in msg.flags:
-                        continue
-                    raw = f"{msg.subject} {msg.text} {msg.html}"
-                    decoded = html.unescape(raw)
-                    match = code_pattern.search(decoded) or code_pattern.search(raw)
-                    if match:
-                        code = match.group(0)
-                        send_to_paygame(chat_id, f"🔑 Ваш код: {code}\n\n✅ Вход выполнен! Время аренды ({RENT_DURATION_HOURS} ч.) пошло.")
-                        mailbox.flag(msg.uid, 'SEEN', True)
-                        
-                        with db_connection() as conn:
-                            cursor = conn.cursor()
-                            end_rent_time = datetime.now() + timedelta(hours=RENT_DURATION_HOURS)
-                            cursor.execute("""
-                                UPDATE accounts 
-                                SET status = ?, rent_end_time = ?, total_rents = total_rents + 1
-                                WHERE id = ?
-                            """, (STATUS_IN_RENT, end_rent_time.isoformat(), account_id))
-                            conn.commit()
-                        
-                        # Ждём окончания аренды
-                        remaining = RENT_DURATION_HOURS * 3600
-                        while remaining > 0 and not SHUTDOWN_EVENT.is_set():
-                            time.sleep(10)
-                            remaining -= 10
-                        
-                        if SHUTDOWN_EVENT.is_set():
-                            return
-                        
-                        logout_success = trigger_logout_session(user_email, user_pass, imap_server)
-                        if logout_success:
-                            send_account_to_rest(account_id)
-                            send_to_paygame(chat_id, f"⏰ Время аренды истекло. Аккаунт ушёл на отдых на {REST_DAYS} день.")
-                        else:
-                            update_account_status(account_id, STATUS_MANUAL_RESET)
-                        return
+                idle = mailbox.idle()
+                try:
+                    while not SHUTDOWN_EVENT.is_set():
+                        idle.wait(5)
+                        for msg in mailbox.fetch('(UNSEEN)'):
+                            if SHUTDOWN_EVENT.is_set():
+                                break
+                            if '\\Seen' in msg.flags:
+                                continue
+                            raw = f"{msg.subject} {msg.text} {msg.html}"
+                            decoded = html.unescape(raw)
+                            match = code_pattern.search(decoded) or code_pattern.search(raw)
+                            if match:
+                                code = match.group(0)
+                                send_to_paygame(chat_id, f"🔑 Ваш код: {code}\n\n✅ Вход выполнен! Время аренды ({RENT_DURATION_HOURS} ч.) пошло.\n🎮 Удачной игры!")
+                                mailbox.flag(msg.uid, 'SEEN', True)
+                                
+                                with db_connection() as conn:
+                                    cursor = conn.cursor()
+                                    end_rent_time = datetime.now() + timedelta(hours=RENT_DURATION_HOURS)
+                                    cursor.execute("""
+                                        UPDATE accounts 
+                                        SET status = ?, rent_end_time = ?, total_rents = total_rents + 1
+                                        WHERE id = ?
+                                    """, (STATUS_IN_RENT, end_rent_time.isoformat(), account_id))
+                                    conn.commit()
+                                
+                                # Ждём окончания аренды
+                                remaining = RENT_DURATION_HOURS * 3600
+                                while remaining > 0 and not SHUTDOWN_EVENT.is_set():
+                                    time.sleep(10)
+                                    remaining -= 10
+                                    # Проверяем статус
+                                    with db_connection() as conn:
+                                        c = conn.cursor()
+                                        c.execute("SELECT status FROM accounts WHERE id = ?", (account_id,))
+                                        row = c.fetchone()
+                                        if row and row[0] != STATUS_IN_RENT:
+                                            logger.info(f"Аккаунт {user_email} уже не в аренде")
+                                            return
+                                
+                                if SHUTDOWN_EVENT.is_set():
+                                    return
+                                
+                                logout_success = trigger_logout_session(user_email, user_pass, imap_server)
+                                if logout_success:
+                                    send_account_to_rest(account_id)
+                                    send_to_paygame(chat_id, f"⏰ Время аренды истекло. Аккаунт ушёл на отдых на {REST_DAYS} день.\n⭐ Оцените наш сервис!")
+                                else:
+                                    update_account_status(account_id, STATUS_MANUAL_RESET)
+                                return
+                finally:
+                    idle.stop()
         except Exception as e:
             logger.warning(f"Ошибка IDLE для {mask_email(user_email)}: {e}")
             time.sleep(5)
@@ -850,6 +880,7 @@ def send_account_to_rest(account_id: int):
             cursor.execute("UPDATE accounts SET status = ?, rest_until = ? WHERE id = ?",
                          (STATUS_REST, rest_until_time.isoformat(), account_id))
             conn.commit()
+            logger.info(f"Аккаунт ID {account_id} отправлен на отдых до {rest_until_time}")
     except Exception as e:
         logger.error(f"Ошибка отправки в REST: {e}")
 
@@ -873,51 +904,65 @@ def trigger_logout_session(user, pwd, server) -> bool:
                         target_url = clean_extracted_url(links[0])
                         response = session.get(target_url, timeout=15, allow_redirects=True)
                         if response.status_code in [200, 302, 301]:
+                            logger.info(f"Выход выполнен для {mask_email(user)}")
                             return True
             return False
-        except Exception:
+        except Exception as e:
+            logger.error(f"Ошибка выхода для {mask_email(user)}: {e}")
             return False
 
 # =============================================================================
-# SALES LISTENER
+# SALES LISTENER (ИСПРАВЛЕН)
 # =============================================================================
 def sales_listener_thread():
     logger.info("Поток мониторинга продаж запущен.")
     while not SHUTDOWN_EVENT.is_set():
         try:
             with MailBox(IMAP_MASTER_SERVER, timeout=15).login(MASTER_EMAIL, MASTER_PASSWORD, 'INBOX') as mailbox:
-                for msg in mailbox.idle(wait_timeout=5):
-                    if SHUTDOWN_EVENT.is_set():
-                        break
-                    body = msg.text or msg.html or ""
-                    sender = msg.from_ or ""
-                    if "noreply@paygame.ru" in sender.lower():
-                        match = re.search(r"chats/(\d+)", body)
-                        if match:
-                            chat_id = match.group(1)
-                            allocate_account_and_start_idle(chat_id)
-                            mailbox.flag(msg.uid, 'SEEN', True)
-                    elif "сообщение" in body.lower():
-                        chat_match = re.search(r"chats/(\d+)", body)
-                        if chat_match:
-                            chat_id = chat_match.group(1)
-                            buyer_text = re.search(r"Покупатель:\s*(.*)", body)
-                            buyer_text = buyer_text.group(1) if buyer_text else "Вопрос"
-                            with db_connection() as conn:
-                                cursor = conn.cursor()
-                                cursor.execute("SELECT status, email, trophies FROM accounts WHERE chat_id = ?", (chat_id,))
-                                acc_info = cursor.fetchone()
-                            status_desc = "Оплата не подтверждена"
-                            if acc_info:
-                                if acc_info[0] == STATUS_WAIT_CODE:
-                                    status_desc = f"Ожидание кода для {mask_email(acc_info[1])}"
-                                elif acc_info[0] == STATUS_IN_RENT:
-                                    status_desc = f"Активна аренда {mask_email(acc_info[1])}"
-                            ai_reply = ask_ai_assistant(chat_id, buyer_text, status_desc)
-                            send_to_paygame(chat_id, f"🤖 {ai_reply}")
-                            mailbox.flag(msg.uid, 'SEEN', True)
-        except Exception:
-            logger.exception("Ошибка мониторинга продаж")
+                idle = mailbox.idle()
+                try:
+                    while not SHUTDOWN_EVENT.is_set():
+                        idle.wait(5)
+                        for msg in mailbox.fetch('(UNSEEN)'):
+                            if SHUTDOWN_EVENT.is_set():
+                                break
+                            body = msg.text or msg.html or ""
+                            sender = msg.from_ or ""
+                            
+                            if "noreply@paygame.ru" in sender.lower():
+                                match = re.search(r"chats/(\d+)", body)
+                                if match:
+                                    chat_id = match.group(1)
+                                    logger.info(f"Новая продажа! Чат: {chat_id}")
+                                    allocate_account_and_start_idle(chat_id)
+                                    mailbox.flag(msg.uid, 'SEEN', True)
+                            
+                            elif "сообщение" in body.lower() or "message" in body.lower():
+                                chat_match = re.search(r"chats/(\d+)", body)
+                                if chat_match:
+                                    chat_id = chat_match.group(1)
+                                    buyer_text = re.search(r"Покупатель:\s*(.*)", body)
+                                    buyer_text = buyer_text.group(1) if buyer_text else "Вопрос"
+                                    
+                                    with db_connection() as conn:
+                                        cursor = conn.cursor()
+                                        cursor.execute("SELECT status, email, trophies FROM accounts WHERE chat_id = ?", (chat_id,))
+                                        acc_info = cursor.fetchone()
+                                    
+                                    status_desc = "Оплата не подтверждена"
+                                    if acc_info:
+                                        if acc_info[0] == STATUS_WAIT_CODE:
+                                            status_desc = f"Ожидание кода для {mask_email(acc_info[1])}"
+                                        elif acc_info[0] == STATUS_IN_RENT:
+                                            status_desc = f"Активна аренда {mask_email(acc_info[1])}"
+                                    
+                                    ai_reply = ask_ai_assistant(chat_id, buyer_text, status_desc)
+                                    send_to_paygame(chat_id, f"🤖 {ai_reply}")
+                                    mailbox.flag(msg.uid, 'SEEN', True)
+                finally:
+                    idle.stop()
+        except Exception as e:
+            logger.exception(f"Ошибка мониторинга продаж: {e}")
         SHUTDOWN_EVENT.wait(POLL_INTERVAL)
 
 # =============================================================================
@@ -926,28 +971,35 @@ def sales_listener_thread():
 def watchdog_and_timer_thread():
     logger.info("Поток Watchdog запущен.")
     while not SHUTDOWN_EVENT.is_set():
+        # Проверка истекших аренд
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM accounts WHERE status = ? AND rent_end_time <= datetime('now')", (STATUS_IN_RENT,))
                 expired = cursor.fetchall()
                 for acc in expired:
+                    logger.info(f"Срок аренды аккаунта {mask_email(acc['email'])} истек.")
                     logout_success = trigger_logout_session(acc[1], acc[2], acc[3])
                     if logout_success:
                         send_account_to_rest(acc[0])
+                        send_to_paygame(acc[8], f"⏰ Время аренды истекло. Аккаунт ушёл на отдых.")
                     else:
                         update_account_status(acc[0], STATUS_MANUAL_RESET)
+                        send_telegram_notification(f"🚨 Требуется ручной сброс: {mask_email(acc[1])}")
         except Exception:
             logger.exception("Ошибка в watchdog")
         
+        # Возврат аккаунтов с отдыха
         try:
             with db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM accounts WHERE status = ? AND rest_until <= datetime('now')", (STATUS_REST,))
                 rested = cursor.fetchall()
                 for acc in rested:
+                    logger.info(f"Отдых для {mask_email(acc['email'])} завершен. Возвращаем в продажу.")
                     cursor.execute("UPDATE accounts SET status = ?, rest_until = NULL WHERE id = ?", (STATUS_FREE, acc[0]))
                     conn.commit()
+                    send_telegram_notification(f"♻️ Аккаунт {mask_email(acc['email'])} снова в продаже!")
         except Exception:
             logger.exception("Ошибка возврата аккаунтов из отдыха")
         
@@ -986,6 +1038,7 @@ def main():
         return
     
     initialize_database()
+    verify_paygame_session()
     
     threading.Thread(target=run_admin_server, name="AdminPanel", daemon=True).start()
     threading.Thread(target=railway_self_pinger, name="Pinger", daemon=True).start()
@@ -993,7 +1046,7 @@ def main():
     threading.Thread(target=watchdog_and_timer_thread, name="Watchdog", daemon=True).start()
     
     logger.info("✅ Бот успешно запущен!")
-    send_telegram_notification("🚀 Бот Brawl Stars запущен!")
+    send_telegram_notification("🚀 Бот Brawl Stars успешно запущен! Админ панель: " + (RAILWAY_PUBLIC_URL or "http://localhost:8080"))
     
     try:
         while not SHUTDOWN_EVENT.is_set():
