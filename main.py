@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from typing import Optional, Dict, List
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 import openai
 from imap_tools import MailBox
@@ -178,6 +180,15 @@ def add_to_blacklist(chat_id: str, reason: str = "Нарушение прави�
             conn.commit()
     except Exception as e:
         logger.error(f"Ошибка добавления в черный список: {e}")
+
+def remove_from_blacklist(chat_id: str):
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM blacklist WHERE chat_id = ?", (chat_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка удаления из черного списка: {e}")
 
 # =============================================================================
 # SHUTDOWN
@@ -523,6 +534,168 @@ def ask_ai_assistant(chat_id: str, buyer_message: str, current_bot_status: str) 
         return "Я зафиксировал ваш вопрос. Администратор ответит вам в ближайшее время."
 
 # =============================================================================
+# TELEGRAM BOT HANDLERS
+# =============================================================================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("📋 Аккаунты", callback_data="accounts")],
+        [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add_account")],
+        [InlineKeyboardButton("🔄 Обновить кубки", callback_data="update_trophies")],
+        [InlineKeyboardButton("🚫 Черный список", callback_data="blacklist")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🎮 <b>Панель управления ботом Brawl Stars</b>\n\n"
+        "Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    chat_id = str(query.message.chat.id)
+    
+    if data == "stats":
+        stats = get_stats()
+        if stats.get('error'):
+            await query.edit_message_text(f"❌ Ошибка: {stats['error']}")
+            return
+        text = (
+            f"📊 <b>СТАТИСТИКА</b>\n\n"
+            f"📦 Всего аккаунтов: <b>{stats['total']}</b>\n"
+            f"🟢 Свободных: <b>{stats['free']}</b>\n"
+            f"🟠 В аренде: <b>{stats['rented']}</b>\n"
+            f"🔴 На отдыхе: <b>{stats['resting']}</b>\n"
+            f"💰 Выручка: <b>{stats['revenue']}₽</b>\n"
+            f"📈 Продаж сегодня: <b>{stats['today_sales']}</b>"
+        )
+        await query.edit_message_text(text, parse_mode="HTML")
+    
+    elif data == "accounts":
+        accounts = get_accounts()
+        if not accounts:
+            await query.edit_message_text("📋 Аккаунтов пока нет.")
+            return
+        text = "📋 <b>АККАУНТЫ</b>\n\n"
+        for acc in accounts[:10]:
+            status_emoji = "🟢" if acc['status_code'] == 0 else "🟠" if acc['status_code'] == 2 else "🔴"
+            text += (
+                f"{status_emoji} <b>{acc['id']}</b> | {acc['email']}\n"
+                f"   🏆 {acc['trophies']} | 💰 {acc['price']}₽ | {acc['status']}\n"
+            )
+        if len(accounts) > 10:
+            text += f"\n... и ещё {len(accounts) - 10} аккаунтов"
+        await query.edit_message_text(text, parse_mode="HTML")
+    
+    elif data == "add_account":
+        await query.edit_message_text(
+            "➕ <b>ДОБАВЛЕНИЕ АККАУНТА</b>\n\n"
+            "Используйте команду:\n"
+            "<code>/addaccount email, password, imap_server, player_tag, trophies, price, rent_days</code>\n\n"
+            "Пример:\n"
+            "<code>/addaccount test@mail.com, pass123, imap.mail.ru, #2PPQVUQ8J, 500, 150, 2</code>",
+            parse_mode="HTML"
+        )
+    
+    elif data == "update_trophies":
+        await query.edit_message_text("🔄 Обновление кубков...")
+        update_all_accounts_stats()
+        await query.edit_message_text("✅ Кубки всех аккаунтов обновлены!")
+    
+    elif data == "blacklist":
+        blacklist = get_blacklist()
+        if not blacklist:
+            await query.edit_message_text("🚫 Черный список пуст.")
+            return
+        text = "🚫 <b>ЧЕРНЫЙ СПИСОК</b>\n\n"
+        for item in blacklist[:10]:
+            text += f"• <b>{item['chat_id']}</b> — {item['reason']} ({item['created_at']})\n"
+        await query.edit_message_text(text, parse_mode="HTML")
+    
+    elif data == "settings":
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "⚙️ <b>НАСТРОЙКИ</b>\n\n"
+            "Выберите действие:",
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+    
+    elif data == "back":
+        await start(query.message, context)
+
+# =============================================================================
+# TELEGRAM COMMANDS
+# =============================================================================
+async def add_account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.message.chat.id)
+    args = ' '.join(context.args)
+    
+    if chat_id != TELEGRAM_ADMIN_CHAT_ID:
+        await update.message.reply_text("⛔ У вас нет прав для этой команды.")
+        return
+    
+    if not args:
+        await update.message.reply_text(
+            "❌ Используйте формат:\n"
+            "<code>/addaccount email, password, imap_server, player_tag, trophies, price, rent_days</code>\n\n"
+            "Пример:\n"
+            "<code>/addaccount test@mail.com, pass123, imap.mail.ru, #2PPQVUQ8J, 500, 150, 2</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        parts = [p.strip() for p in args.split(',')]
+        if len(parts) < 7:
+            await update.message.reply_text("❌ Недостаточно данных. Нужно 7 полей.")
+            return
+        
+        data = {
+            'email': parts[0],
+            'password': parts[1],
+            'imap_server': parts[2],
+            'player_tag': parts[3],
+            'trophies': int(parts[4]),
+            'price': int(parts[5]),
+            'rent_days': int(parts[6]),
+            'gems': 0,
+            'photos': []
+        }
+        
+        result = add_account(data)
+        if result['success']:
+            await update.message.reply_text(f"✅ Аккаунт {parts[0]} успешно добавлен!")
+        else:
+            await update.message.reply_text(f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+# =============================================================================
+# UPDATE ALL STATS
+# =============================================================================
+def update_all_accounts_stats():
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, player_tag FROM accounts WHERE player_tag IS NOT NULL AND player_tag != ''")
+            accounts = cursor.fetchall()
+            for acc in accounts:
+                if acc[1]:
+                    update_account_stats(acc[0], acc[1])
+            log_event("all_stats_updated", None, None, "Обновлена статистика всех аккаунтов")
+    except Exception as e:
+        logger.error(f"Ошибка обновления всех аккаунтов: {e}")
+
+# =============================================================================
 # WEB ADMIN PANEL
 # =============================================================================
 class AdminPanelHandler(BaseHTTPRequestHandler):
@@ -576,7 +749,7 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(result).encode('utf-8'))
         elif self.path == '/api/account/republish':
-            content_length = int(self.headers['Content-Length'])
+            content_length = int(self.headers('Content-Length'))
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
             result = republish_listing(data.get('id'))
@@ -585,7 +758,7 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({'success': result}).encode('utf-8'))
         elif self.path == '/api/blacklist/add':
-            content_length = int(self.headers['Content-Length'])
+            content_length = int(self.headers('Content-Length'))
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
             result = add_to_blacklist(data.get('chat_id'), data.get('reason'), data.get('permanent', False))
@@ -594,21 +767,14 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({'success': result}).encode('utf-8'))
         elif self.path == '/api/blacklist/remove':
-            content_length = int(self.headers['Content-Length'])
+            content_length = int(self.headers('Content-Length'))
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
-            try:
-                with db_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("DELETE FROM blacklist WHERE chat_id = ?", (data.get('chat_id'),))
-                    conn.commit()
-                result = {'success': True}
-            except Exception as e:
-                result = {'success': False, 'error': str(e)}
+            remove_from_blacklist(data.get('chat_id'))
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps(result).encode('utf-8'))
+            self.wfile.write(json.dumps({'success': True}).encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
@@ -700,6 +866,22 @@ def get_logs():
                     'created_at': row[5] or '-'
                 })
             return logs
+    except Exception as e:
+        return []
+
+def get_blacklist():
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, chat_id, reason, permanent, created_at FROM blacklist")
+            rows = cursor.fetchall()
+            items = []
+            for row in rows:
+                items.append({
+                    'id': row[0], 'chat_id': row[1], 'reason': row[2] or '-',
+                    'permanent': bool(row[3]), 'created_at': row[4] or '-'
+                })
+            return items
     except Exception as e:
         return []
 
@@ -962,6 +1144,26 @@ def run_admin_server():
         logger.error(f"Не удалось запустить админ панель: {e}")
 
 # =============================================================================
+# TELEGRAM BOT MAIN
+# =============================================================================
+def run_telegram_bot():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("⚠️ TELEGRAM_BOT_TOKEN не задан. Telegram бот не запущен.")
+        return
+    
+    try:
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("addaccount", add_account_command))
+        application.add_handler(CallbackQueryHandler(button_handler))
+        
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("✅ Telegram бот успешно запущен!")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска Telegram бота: {e}")
+
+# =============================================================================
 # THREAD POOL
 # =============================================================================
 idle_thread_pool = ThreadPoolExecutor(max_workers=MAX_IDLE_THREADS)
@@ -1010,6 +1212,8 @@ def allocate_account_and_start_idle(chat_id: str, order_data: dict):
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (chat_id, account[0], account[1], account[3], account[4] or 0, account[6], rent_days))
             conn.commit()
+            
+            send_telegram_notification(f"🛒 Новая продажа!\nЧат: {chat_id}\nАккаунт: {mask_email(account[1])}\nЦена: {account[6]}₽\nДней: {rent_days}")
             
             idle_thread_pool.submit(
                 instant_code_waiter,
@@ -1065,6 +1269,8 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
                             """, (STATUS_IN_RENT, end_rent_time.isoformat(), account_id))
                             conn.commit()
                         
+                        send_telegram_notification(f"🔑 Код выдан для чата {chat_id}. Аренда на {rent_days} д.")
+                        
                         # Ждём окончания аренды
                         remaining = rent_days * 24 * 3600
                         while remaining > 0 and not SHUTDOWN_EVENT.is_set():
@@ -1085,9 +1291,11 @@ def instant_code_waiter(account_id: int, user_email: str, user_pass: str, imap_s
                         if logout_success:
                             send_account_to_rest(account_id)
                             send_to_paygame(chat_id, f"⏰ Время аренды ({rent_days} д.) истекло. Аккаунт ушёл на отдых на {REST_DAYS} день.\n♻️ Скоро снова в продаже!")
+                            send_telegram_notification(f"⏰ Аренда завершена: {mask_email(user_email)}")
                         else:
                             update_account_status(account_id, STATUS_MANUAL_RESET)
                             send_to_paygame(chat_id, "⚠️ Не удалось выйти. Выйдите вручную.")
+                            send_telegram_notification(f"🚨 Требуется ручной сброс: {mask_email(user_email)}")
                         return
         except Exception as e:
             logger.warning(f"Ошибка проверки почты для {mask_email(user_email)}: {e}")
@@ -1244,6 +1452,7 @@ def main():
     threading.Thread(target=railway_self_pinger, name="Pinger", daemon=True).start()
     threading.Thread(target=sales_listener_thread, name="SalesListener", daemon=True).start()
     threading.Thread(target=watchdog_and_timer_thread, name="Watchdog", daemon=True).start()
+    threading.Thread(target=run_telegram_bot, name="TelegramBot", daemon=True).start()
     
     logger.info("✅ Бот успешно запущен!")
     send_telegram_notification("🚀 Бот Brawl Stars успешно запущен! Админ панель: " + (RAILWAY_PUBLIC_URL or "http://localhost:8080"))
