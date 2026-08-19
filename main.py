@@ -8,6 +8,7 @@ import html
 import requests
 import json
 import sqlite3
+import asyncio
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -471,7 +472,6 @@ def send_to_paygame(chat_id: str, text: str, retries: int = MAX_RETRY_ATTEMPTS) 
     if not chat_id:
         return False
     if is_chat_blacklisted(chat_id):
-        send_to_paygame(chat_id, "🚫 Вы в черном списке. Обратитесь к администратору.")
         return False
     url = f"https://paygame.ru{chat_id}/messages"
     for attempt in range(retries):
@@ -761,11 +761,11 @@ class AdminPanelHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers('Content-Length'))
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
-            result = add_to_blacklist(data.get('chat_id'), data.get('reason'), data.get('permanent', False))
+            add_to_blacklist(data.get('chat_id'), data.get('reason'), data.get('permanent', False))
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({'success': result}).encode('utf-8'))
+            self.wfile.write(json.dumps({'success': True}).encode('utf-8'))
         elif self.path == '/api/blacklist/remove':
             content_length = int(self.headers('Content-Length'))
             post_data = self.rfile.read(content_length)
@@ -1144,9 +1144,9 @@ def run_admin_server():
         logger.error(f"Не удалось запустить админ панель: {e}")
 
 # =============================================================================
-# TELEGRAM BOT MAIN
+# TELEGRAM BOT ASYNC
 # =============================================================================
-def run_telegram_bot():
+async def run_telegram_bot_async():
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("⚠️ TELEGRAM_BOT_TOKEN не задан. Telegram бот не запущен.")
         return
@@ -1158,8 +1158,20 @@ def run_telegram_bot():
         application.add_handler(CommandHandler("addaccount", add_account_command))
         application.add_handler(CallbackQueryHandler(button_handler))
         
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        
         logger.info("✅ Telegram бот успешно запущен!")
+        send_telegram_notification("🤖 Telegram бот запущен!")
+        
+        # Держим бота активным
+        while not SHUTDOWN_EVENT.is_set():
+            await asyncio.sleep(1)
+            
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
     except Exception as e:
         logger.error(f"❌ Ошибка запуска Telegram бота: {e}")
 
@@ -1452,7 +1464,15 @@ def main():
     threading.Thread(target=railway_self_pinger, name="Pinger", daemon=True).start()
     threading.Thread(target=sales_listener_thread, name="SalesListener", daemon=True).start()
     threading.Thread(target=watchdog_and_timer_thread, name="Watchdog", daemon=True).start()
-    threading.Thread(target=run_telegram_bot, name="TelegramBot", daemon=True).start()
+    
+    # Запускаем Telegram бот в основном потоке асинхронно
+    try:
+        asyncio.run(run_telegram_bot_async())
+    except RuntimeError:
+        # Если event loop уже запущен
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_telegram_bot_async())
     
     logger.info("✅ Бот успешно запущен!")
     send_telegram_notification("🚀 Бот Brawl Stars успешно запущен! Админ панель: " + (RAILWAY_PUBLIC_URL or "http://localhost:8080"))
